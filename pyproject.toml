@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hw-attest-verify"
+version = "0.1.0"
+description = "Verification library for RFC Hardware-Attestation and Hardware-Trust-Proof email headers"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [
+  {name = "Christopher Drake", email = "cnd@1id.com"},
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security :: Cryptography",
+  "Topic :: Communications :: Email",
+]
+dependencies = [
+  "cryptography>=41.0",
+]
+
+[project.optional-dependencies]
+dns = ["dnspython>=2.4"]
+
+[project.scripts]
+hw-attest-verify = "hw_attest_verify.__main__:main"
+
+[project.urls]
+Homepage = "https://1id.com"
+Repository = "https://github.com/1id-com/hw-attest-verify"
+Documentation = "https://1id.com/docs/verify"
+
+[tool.setuptools.packages.find]
+include = ["hw_attest_verify*"]
+
