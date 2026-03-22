@@ -153,8 +153,13 @@ def verify_hardware_attestation(
 
   header_value_without_chain_for_self_reference = _reconstruct_header_template_without_chain(parsed)
 
+  signed_headers_only = {
+    k: v for k, v in email_headers.items()
+    if k.strip().lower() in parsed.signed_header_names
+  }
+
   attestation_digest = _compute_attestation_digest(
-    email_headers=email_headers,
+    email_headers=signed_headers_only,
     body_bytes=body,
     attestation_timestamp_unix=parsed.ts,
     header_value_without_chain=header_value_without_chain_for_self_reference,
@@ -499,7 +504,7 @@ def _verify_signature_against_certificate(
         return f"Certificate has {type(public_key).__name__}, expected RSA for RS256"
       public_key.verify(
         signature_bytes, signed_data,
-        padding.PKCS1v15(), utils.Prehashed(hashes.SHA256()),
+        padding.PKCS1v15(), hashes.SHA256(),
       )
     elif algorithm_name == "PS256":
       if not isinstance(public_key, rsa.RSAPublicKey):

@@ -388,14 +388,6 @@ def _compute_message_binding_nonce(
       canon_value = _dkim_relaxed_header_value(lowered[required_name])
       lines.append(f"{required_name}:{canon_value}\r\n")
 
-  for extra_name in sorted(lowered.keys()):
-    if extra_name in _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING:
-      continue
-    if extra_name == "hardware-trust-proof":
-      continue
-    canon_value = _dkim_relaxed_header_value(lowered[extra_name])
-    lines.append(f"{extra_name}:{canon_value}\r\n")
-
   lines.append("hardware-trust-proof:")
 
   canonicalised_header_bytes = "".join(lines).encode("utf-8")
