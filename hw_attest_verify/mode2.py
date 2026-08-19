@@ -73,6 +73,8 @@ class Mode2VerificationResult:
   disclosed_claims: Dict[str, object] = field(default_factory=dict)
   failure_reason: str = ""
   failure_reasons: List[str] = field(default_factory=list)
+  is_identified_mode: bool = False
+  rdap_issuer_verified: bool = False
 
 
 def verify_hardware_trust_proof(
@@ -143,6 +145,10 @@ def verify_hardware_trust_proof(
     failure_reasons.append("Missing iss (issuer) claim in SD-JWT payload")
 
   result.issuer = issuer
+
+  jwt_typ = jwt_header.get("typ", "")
+  if jwt_typ and jwt_typ != "airs-email+sd-jwt":
+    failure_reasons.append(f"Unexpected typ header: {jwt_typ!r} (expected 'airs-email+sd-jwt')")
 
   algorithm = jwt_header.get("alg", "")
   if algorithm != "ES256":
@@ -229,8 +235,27 @@ def verify_hardware_trust_proof(
       )
 
   result.disclosed_claims = disclosed_claims
-  result.trust_tier = str(disclosed_claims.get("trust_tier", jwt_payload.get("trust_tier", "")))
+
+  aid_claim = disclosed_claims.get("aid")
+  if isinstance(aid_claim, dict):
+    result.trust_tier = str(aid_claim.get("trust_tier", ""))
+  else:
+    result.trust_tier = str(disclosed_claims.get("trust_tier", jwt_payload.get("trust_tier", "")))
+
   result.agent_identity_urn = str(jwt_payload.get("sub", ""))
+  result.is_identified_mode = bool(result.agent_identity_urn)
+
+  if result.is_identified_mode and not failure_reasons:
+    rdap_issuer = _resolve_issuer_via_rdap(result.agent_identity_urn)
+    if rdap_issuer is not None:
+      if rdap_issuer == issuer:
+        result.rdap_issuer_verified = True
+      else:
+        failure_reasons.append(
+          f"RDAP currentIssuer {rdap_issuer!r} does not match JWT iss {issuer!r}"
+        )
+    else:
+      pass
 
   if failure_reasons:
     result.failure_reasons = failure_reasons
@@ -482,4 +507,37 @@ def _compute_message_binding_nonce(
   nonce_raw = hashlib.sha256(message_binding).digest()
 
   return _base64url_encode_no_padding(nonce_raw)
+
+
+_RDAP_TIMEOUT_SECONDS = 5.0
+_AIRS_RDAP_BASE_URL = "https://airs.1id.biz"
+
+
+def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
+  """Resolve an agent identity URN via AIRS RDAP and return currentIssuer.
+
+  Per draft-drake-agent-identity-resolution-00 Section 4, the verifier
+  resolves the sub claim to confirm the issuer matches the RDAP-advertised
+  currentIssuer for that identity.
+
+  Returns the currentIssuer string, or None if RDAP lookup fails or the
+  identity is not found (non-fatal -- allows offline/degraded verification).
+  """
+  import urllib.request
+  import urllib.error
+
+  urn_path = agent_identity_urn
+  if urn_path.startswith("urn:aid:"):
+    urn_path = urn_path[len("urn:aid:"):]
+
+  rdap_url = f"{_AIRS_RDAP_BASE_URL}/rdap/aid_identity/{urn_path}"
+
+  try:
+    request = urllib.request.Request(rdap_url, headers={"Accept": "application/rdap+json"})
+    with urllib.request.urlopen(request, timeout=_RDAP_TIMEOUT_SECONDS) as response:
+      data = json.loads(response.read().decode("utf-8"))
+      aid_data = data.get("aid_data", {})
+      return aid_data.get("currentIssuer")
+  except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError):
+    return None
 

@@ -87,23 +87,23 @@ def _make_test_sd_jwt(private_key, email_headers, body, extra_claims=None):
 
   nonce = _compute_message_binding_nonce(email_headers, body, iat)
 
-  trust_tier_disclosure = _make_disclosure("salt1", "trust_tier", "sovereign")
-  trust_tier_hash = _b64url_encode(
-    hashlib.sha256(trust_tier_disclosure.encode("ascii")).digest()
+  aid_disclosure = _make_disclosure("salt1", "aid", {"trust_tier": "sovereign"})
+  aid_disclosure_hash = _b64url_encode(
+    hashlib.sha256(aid_disclosure.encode("ascii")).digest()
   )
 
   payload = {
     "iss": "https://1id.com",
-    "sub": "urn:aid:1id.com:test-agent",
+    "sub": "urn:aid:global:id-aaaaa-bbbbb-ccccc-ddddd",
     "iat": iat,
     "exp": exp,
     "nonce": nonce,
-    "_sd": [trust_tier_hash],
+    "_sd": [aid_disclosure_hash],
   }
   if extra_claims:
     payload.update(extra_claims)
 
-  header = {"alg": "ES256", "typ": "sd-jwt"}
+  header = {"alg": "ES256", "typ": "airs-email+sd-jwt"}
 
   jwt_compact = _sign_jwt_es256(
     private_key,
@@ -111,7 +111,7 @@ def _make_test_sd_jwt(private_key, email_headers, body, extra_claims=None):
     json.dumps(payload),
   )
 
-  return f"{jwt_compact}~{trust_tier_disclosure}~"
+  return f"{jwt_compact}~{aid_disclosure}~"
 
 
 class TestSdJwtParsing:
@@ -165,17 +165,17 @@ class TestMessageBindingNonce:
 
 
 class TestDisclosureVerification:
-  def test_valid_disclosure_extracts_claim(self):
-    disclosure = _make_disclosure("salt", "trust_tier", "sovereign")
+  def test_valid_nested_aid_disclosure_extracts_claim(self):
+    disclosure = _make_disclosure("salt", "aid", {"trust_tier": "sovereign"})
     disclosure_hash = _b64url_encode(
       hashlib.sha256(disclosure.encode("ascii")).digest()
     )
     claims, errors = _verify_and_extract_disclosures([disclosure], [disclosure_hash])
     assert errors == []
-    assert claims["trust_tier"] == "sovereign"
+    assert claims["aid"] == {"trust_tier": "sovereign"}
 
   def test_disclosure_with_wrong_hash_reports_error(self):
-    disclosure = _make_disclosure("salt", "trust_tier", "sovereign")
+    disclosure = _make_disclosure("salt", "aid", {"trust_tier": "sovereign"})
     claims, errors = _verify_and_extract_disclosures([disclosure], ["wrong_hash"])
     assert len(errors) == 1
     assert "not found in _sd array" in errors[0]
@@ -250,22 +250,22 @@ class TestEndToEndMode2Verification:
     old_time = int(time.time()) - 7200
 
     nonce = _compute_message_binding_nonce(headers, body, old_time)
-    trust_tier_disclosure = _make_disclosure("salt1", "trust_tier", "sovereign")
-    trust_tier_hash = _b64url_encode(
-      hashlib.sha256(trust_tier_disclosure.encode("ascii")).digest()
+    aid_disclosure = _make_disclosure("salt1", "aid", {"trust_tier": "sovereign"})
+    aid_disclosure_hash = _b64url_encode(
+      hashlib.sha256(aid_disclosure.encode("ascii")).digest()
     )
 
     payload = json.dumps({
       "iss": "https://1id.com",
-      "sub": "urn:aid:1id.com:test",
+      "sub": "urn:aid:global:id-aaaaa-bbbbb-ccccc-ddddd",
       "iat": old_time,
       "exp": old_time + 300,
       "nonce": nonce,
-      "_sd": [trust_tier_hash],
+      "_sd": [aid_disclosure_hash],
     })
-    header = json.dumps({"alg": "ES256", "typ": "sd-jwt"})
+    header = json.dumps({"alg": "ES256", "typ": "airs-email+sd-jwt"})
     jwt = _sign_jwt_es256(private_key, header, payload)
-    presentation = f"{jwt}~{trust_tier_disclosure}~"
+    presentation = f"{jwt}~{aid_disclosure}~"
 
     result = verify_hardware_trust_proof(
       header_value=presentation,
@@ -275,4 +275,89 @@ class TestEndToEndMode2Verification:
     )
     assert not result.is_valid
     assert any("expired" in r.lower() or "iat" in r.lower() for r in result.failure_reasons)
+
+
+def _make_hidden_mode_sd_jwt(private_key, email_headers, body):
+  """Build an SD-JWT with no sub claim (hidden / anonymous mode)."""
+  iat = int(time.time())
+  exp = iat + 300
+  nonce = _compute_message_binding_nonce(email_headers, body, iat)
+
+  aid_disclosure = _make_disclosure("salt1", "aid", {"trust_tier": "declared"})
+  aid_hash = _b64url_encode(
+    hashlib.sha256(aid_disclosure.encode("ascii")).digest()
+  )
+
+  payload = {
+    "iss": "https://1id.com",
+    "iat": iat,
+    "exp": exp,
+    "nonce": nonce,
+    "_sd": [aid_hash],
+  }
+  header = {"alg": "ES256", "typ": "airs-email+sd-jwt"}
+  jwt_compact = _sign_jwt_es256(private_key, json.dumps(header), json.dumps(payload))
+  return f"{jwt_compact}~{aid_disclosure}~"
+
+
+class TestMode2IdentifiedVsHidden:
+  """G3.4 / G3.5: identified mode (with sub) vs hidden mode (no sub)."""
+
+  def test_identified_mode_sets_flag_and_urn(self):
+    private_key, public_key = _generate_test_ec_keypair()
+    headers = _make_test_email_headers()
+    body = b"Identified mode test.\r\n"
+    sd_jwt = _make_test_sd_jwt(private_key, headers, body)
+    result = verify_hardware_trust_proof(
+      header_value=sd_jwt,
+      email_headers=headers,
+      body=body,
+      issuer_public_key_override=public_key,
+    )
+    assert result.is_valid
+    assert result.is_identified_mode is True
+    assert result.agent_identity_urn == "urn:aid:global:id-aaaaa-bbbbb-ccccc-ddddd"
+
+  def test_hidden_mode_sets_flag_without_urn(self):
+    private_key, public_key = _generate_test_ec_keypair()
+    headers = _make_test_email_headers()
+    body = b"Hidden mode test.\r\n"
+    sd_jwt = _make_hidden_mode_sd_jwt(private_key, headers, body)
+    result = verify_hardware_trust_proof(
+      header_value=sd_jwt,
+      email_headers=headers,
+      body=body,
+      issuer_public_key_override=public_key,
+    )
+    assert result.is_valid
+    assert result.is_identified_mode is False
+    assert result.agent_identity_urn == ""
+    assert result.trust_tier == "declared"
+
+  def test_wrong_typ_header_fails(self):
+    private_key, public_key = _generate_test_ec_keypair()
+    headers = _make_test_email_headers()
+    body = b"Wrong typ test.\r\n"
+    iat = int(time.time())
+    nonce = _compute_message_binding_nonce(headers, body, iat)
+    aid_disclosure = _make_disclosure("salt1", "aid", {"trust_tier": "declared"})
+    aid_hash = _b64url_encode(
+      hashlib.sha256(aid_disclosure.encode("ascii")).digest()
+    )
+    payload = json.dumps({
+      "iss": "https://1id.com",
+      "iat": iat, "exp": iat + 300, "nonce": nonce,
+      "_sd": [aid_hash],
+    })
+    header = json.dumps({"alg": "ES256", "typ": "WRONG-TYP"})
+    jwt_compact = _sign_jwt_es256(private_key, header, payload)
+    presentation = f"{jwt_compact}~{aid_disclosure}~"
+    result = verify_hardware_trust_proof(
+      header_value=presentation,
+      email_headers=headers,
+      body=body,
+      issuer_public_key_override=public_key,
+    )
+    assert not result.is_valid
+    assert any("typ" in r.lower() for r in result.failure_reasons)
 
