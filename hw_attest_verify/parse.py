@@ -101,7 +101,7 @@ def parse_hardware_attestation_header(header_value: str) -> ParsedHardwareAttest
 
   if "ts" in raw_parameters:
     try:
-      result.ts = int(raw_parameters["ts"])
+      result.ts = int(re.sub(r"[ \t\r\n]+", "", raw_parameters["ts"]))
     except ValueError:
       pass
 
