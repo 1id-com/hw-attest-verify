@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hw-attest-verify"
-version = "1.0.0"
+version = "1.0.1"
 description = "Verification library for RFC Hardware-Attestation and Hardware-Trust-Proof email headers"
 readme = "README.md"
 license = {text = "MIT"}
