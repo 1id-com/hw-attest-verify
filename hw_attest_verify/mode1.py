@@ -25,7 +25,7 @@ from typing import Dict, List, Optional
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa, padding
+from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa, padding
 
 from .parse import ParsedHardwareAttestationHeader, parse_hardware_attestation_header
 
@@ -52,6 +52,9 @@ class VerificationResult:
   failure_reasons: List[str] = field(default_factory=list)
 
 
+_ACCEPTED_CMS_ALGORITHMS = {"RS256", "ES256", "PS256"}
+
+
 def verify_hardware_attestation(
   header_value: str,
   email_headers: Dict[str, str],
@@ -61,6 +64,7 @@ def verify_hardware_attestation(
   trusted_root_certificates: Optional[List[x509.Certificate]] = None,
   allow_self_signed: bool = False,
   reference_time_unix: Optional[int] = None,
+  allow_eddsa: bool = False,
 ) -> VerificationResult:
   """Verify a Mode 1 Hardware-Attestation header.
 
@@ -94,6 +98,13 @@ def verify_hardware_attestation(
 
   if not parsed.alg:
     failure_reasons.append("Missing alg parameter")
+  elif parsed.alg not in _ACCEPTED_CMS_ALGORITHMS:
+    if parsed.alg == "EdDSA" and not allow_eddsa:
+      failure_reasons.append(
+        "EdDSA is not in the Version 1 CMS algorithm table (use --allow-eddsa to accept)"
+      )
+    elif parsed.alg != "EdDSA":
+      failure_reasons.append(f"Unsupported algorithm: {parsed.alg}")
 
   if not parsed.chain_base64:
     failure_reasons.append("Missing or empty chain parameter")
@@ -103,6 +114,14 @@ def verify_hardware_attestation(
 
   if parsed.ts == 0:
     failure_reasons.append("Missing or invalid ts parameter")
+
+  _REQUIRED_SIGNED_HEADERS = {"from", "to", "subject", "date", "message-id"}
+  signed_names_lower = {n.strip().lower() for n in parsed.signed_header_names}
+  missing_required_headers = _REQUIRED_SIGNED_HEADERS - signed_names_lower
+  if missing_required_headers:
+    failure_reasons.append(
+      f"h= tag missing required headers: {', '.join(sorted(missing_required_headers))}"
+    )
 
   if failure_reasons:
     result.failure_reasons = failure_reasons
@@ -127,6 +146,10 @@ def verify_hardware_attestation(
     result.failure_reason = failure_reasons[0]
     return result
 
+  cms_digest_algorithm_validation_error = _validate_cms_digest_algorithm_is_sha256(chain_der_bytes)
+  if cms_digest_algorithm_validation_error:
+    failure_reasons.append(cms_digest_algorithm_validation_error)
+
   extracted_certificates = _extract_certificates_from_cms_signed_data(chain_der_bytes)
   if not extracted_certificates:
     failure_reasons.append("No certificates found in CMS SignedData")
@@ -135,16 +158,6 @@ def verify_hardware_attestation(
     return result
 
   result.certificate_chain_length = len(extracted_certificates)
-  leaf_certificate = extracted_certificates[0]
-
-  try:
-    subject_common_names = leaf_certificate.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
-    if subject_common_names:
-      result.leaf_certificate_subject = subject_common_names[0].value
-    else:
-      result.leaf_certificate_subject = str(leaf_certificate.subject)
-  except Exception:
-    result.leaf_certificate_subject = "(could not extract subject)"
 
   extracted_signature_bytes = _extract_signature_from_cms_signed_data(chain_der_bytes)
   if extracted_signature_bytes is None:
@@ -164,20 +177,43 @@ def verify_hardware_attestation(
     ordered_header_pairs=ordered_header_pairs,
   )
 
-  signature_verification_error = _verify_signature_against_certificate(
-    leaf_certificate=leaf_certificate,
-    signature_bytes=extracted_signature_bytes,
-    attestation_input_72_bytes=attestation_input_72_bytes,
-    algorithm_name=parsed.alg,
-  )
-  if signature_verification_error:
-    failure_reasons.append(f"Signature verification failed: {signature_verification_error}")
+  leaf_certificate = None
+  for candidate_certificate in extracted_certificates:
+    verification_error = _verify_signature_against_certificate(
+      leaf_certificate=candidate_certificate,
+      signature_bytes=extracted_signature_bytes,
+      attestation_input_72_bytes=attestation_input_72_bytes,
+      algorithm_name=parsed.alg,
+    )
+    if verification_error is None:
+      leaf_certificate = candidate_certificate
+      break
+  if leaf_certificate is None:
+    failure_reasons.append(
+      "Signature verification failed: no certificate in the CMS bundle "
+      "has a key that verifies the signature"
+    )
 
-  received_bh_bytes = _base64url_decode(parsed.bh)
-  canonicalised_body = _canonicalise_body_using_dkim_simple(body)
-  recomputed_bh = hashlib.sha256(canonicalised_body).digest()
-  if received_bh_bytes != recomputed_bh:
-    failure_reasons.append("Body hash (bh) does not match recomputed hash")
+  if leaf_certificate is not None:
+    try:
+      subject_common_names = leaf_certificate.subject.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
+      if subject_common_names:
+        result.leaf_certificate_subject = subject_common_names[0].value
+      else:
+        result.leaf_certificate_subject = str(leaf_certificate.subject)
+    except Exception:
+      result.leaf_certificate_subject = "(could not extract subject)"
+
+  try:
+    received_bh_bytes = _base64url_decode(parsed.bh)
+  except Exception as bh_decode_error:
+    failure_reasons.append(f"Could not base64url-decode bh parameter: {bh_decode_error}")
+    received_bh_bytes = None
+  if received_bh_bytes is not None:
+    canonicalised_body = _canonicalise_body_using_dkim_simple(body)
+    recomputed_bh = hashlib.sha256(canonicalised_body).digest()
+    if received_bh_bytes != recomputed_bh:
+      failure_reasons.append("Body hash (bh) does not match recomputed hash")
 
   if trusted_root_certificates:
     chain_validation_error = _validate_certificate_chain(
@@ -191,6 +227,26 @@ def verify_hardware_attestation(
       "Provide trusted_root_certificates or set allow_self_signed=True for testing."
     )
 
+  if parsed.aid and not parsed.bind:
+    failure_reasons.append(
+      "aid is present but bind is absent (sender MUST NOT place aid without Registrar binding)"
+    )
+  elif parsed.bind and not parsed.aid:
+    failure_reasons.append(
+      "bind is present but aid is absent (aid and bind must both appear or both be absent)"
+    )
+
+  if parsed.bind and parsed.aid and leaf_certificate is not None and not failure_reasons:
+    bind_verification_errors = _verify_registrar_binding_jws(
+      bind_compact_jws=parsed.bind,
+      expected_aid=parsed.aid,
+      expected_typ=parsed.typ,
+      signer_certificate=leaf_certificate,
+      reference_time_unix=reference_time_unix if reference_time_unix else int(time.time()),
+      max_timestamp_skew_seconds=max_timestamp_skew_seconds,
+    )
+    failure_reasons.extend(bind_verification_errors)
+
   if failure_reasons:
     result.failure_reasons = failure_reasons
     result.failure_reason = failure_reasons[0]
@@ -200,8 +256,223 @@ def verify_hardware_attestation(
   return result
 
 
+_TYP_TO_EXPECTED_TRUST_TIER = {
+  "TPM": "sovereign",
+  "PIV": "portable",
+  "ENC": "enclave",
+  "VRT": "virtual",
+  "SFT": "declared",
+}
+
+
+def _verify_registrar_binding_jws(
+  bind_compact_jws: str,
+  expected_aid: str,
+  expected_typ: str,
+  signer_certificate: x509.Certificate,
+  reference_time_unix: int,
+  max_timestamp_skew_seconds: int = 300,
+) -> List[str]:
+  """Verify a Registrar Binding JWS per RFC Section 5.4.
+
+  Returns a list of failure reasons (empty = success).
+  """
+  import json
+  errors: List[str] = []
+
+  parts = bind_compact_jws.split(".")
+  if len(parts) != 3:
+    return ["bind JWS is not a valid compact JWS (expected 3 dot-separated parts)"]
+
+  try:
+    header_json = _base64url_decode(parts[0]).decode("utf-8")
+    payload_json = _base64url_decode(parts[1]).decode("utf-8")
+    signature_bytes = _base64url_decode(parts[2])
+  except Exception as decode_error:
+    return [f"bind JWS base64url decode failed: {decode_error}"]
+
+  try:
+    header = json.loads(header_json)
+  except json.JSONDecodeError:
+    return ["bind JWS header is not valid JSON"]
+
+  try:
+    payload = json.loads(payload_json)
+  except json.JSONDecodeError:
+    return ["bind JWS payload is not valid JSON"]
+
+  bind_typ = header.get("typ", "")
+  if bind_typ != "airs-email-binding+jwt":
+    errors.append(
+      f"bind JWS typ must be 'airs-email-binding+jwt' (got {bind_typ!r})"
+    )
+
+  bind_alg = header.get("alg", "")
+  if not bind_alg or bind_alg in ("none", "HS256", "HS384", "HS512"):
+    errors.append(f"bind JWS alg is invalid or symmetric: {bind_alg!r}")
+
+  bind_iss = payload.get("iss", "")
+  if not bind_iss:
+    errors.append("bind JWS missing iss claim")
+
+  bind_sub = payload.get("sub", "")
+  if bind_sub != expected_aid:
+    errors.append(
+      f"bind JWS sub {bind_sub!r} does not match header aid {expected_aid!r}"
+    )
+
+  bind_iat = payload.get("iat")
+  bind_exp = payload.get("exp")
+  if bind_iat is None:
+    errors.append("bind JWS missing iat claim")
+  else:
+    if int(bind_iat) > reference_time_unix + max_timestamp_skew_seconds:
+      errors.append(f"bind JWS iat is in the future: {bind_iat}")
+
+  if bind_exp is None:
+    errors.append("bind JWS missing exp claim")
+  else:
+    if int(bind_exp) < reference_time_unix - max_timestamp_skew_seconds:
+      errors.append(f"bind JWS has expired: exp={bind_exp}, now={reference_time_unix}")
+
+  if bind_iat is not None and bind_exp is not None:
+    if int(bind_exp) <= int(bind_iat):
+      errors.append("bind JWS exp must be later than iat")
+
+  cnf = payload.get("cnf")
+  if not isinstance(cnf, dict) or "jwk" not in cnf:
+    errors.append("bind JWS missing cnf.jwk claim")
+  else:
+    bind_jwk = cnf["jwk"]
+    if any(k in bind_jwk for k in ("d", "p", "q", "dp", "dq", "qi", "k")):
+      errors.append("bind JWS cnf.jwk contains private key parameters")
+    else:
+      signer_jwk_thumbprint = _compute_jwk_thumbprint_from_certificate(signer_certificate)
+      bind_jwk_thumbprint = _compute_jwk_thumbprint_from_jwk_dict(bind_jwk)
+      if signer_jwk_thumbprint and bind_jwk_thumbprint:
+        if signer_jwk_thumbprint != bind_jwk_thumbprint:
+          errors.append(
+            "bind JWS cnf.jwk thumbprint does not match CMS signer public key"
+          )
+      elif not signer_jwk_thumbprint:
+        errors.append("Could not compute JWK thumbprint from CMS signer certificate")
+
+  aid_claim = payload.get("aid")
+  if isinstance(aid_claim, dict):
+    bind_trust_tier = aid_claim.get("trust_tier", "")
+    expected_tier_from_typ = _TYP_TO_EXPECTED_TRUST_TIER.get(expected_typ, "")
+    if expected_tier_from_typ and bind_trust_tier != expected_tier_from_typ:
+      errors.append(
+        f"bind JWS aid.trust_tier {bind_trust_tier!r} does not match "
+        f"expected tier for typ={expected_typ!r} ({expected_tier_from_typ!r})"
+      )
+
+  if not errors:
+    from .issuer_key_discovery import discover_issuer_public_key
+    from urllib.parse import urlparse
+    issuer_domain = urlparse(bind_iss).hostname if bind_iss.startswith("http") else bind_iss
+    bind_kid = header.get("kid")
+    issuer_key = discover_issuer_public_key(issuer_domain, kid=bind_kid) if issuer_domain else None
+    if issuer_key is None:
+      errors.append(
+        f"Could not discover issuer public key for bind JWS issuer {bind_iss!r}"
+      )
+    else:
+      from cryptography.exceptions import InvalidSignature as InvSig
+      signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+      try:
+        if bind_alg == "ES256":
+          sig_for_verify = signature_bytes
+          if len(sig_for_verify) == 64:
+            from .mode2 import _raw_rs_to_der
+            sig_for_verify = _raw_rs_to_der(sig_for_verify)
+          issuer_key.verify(sig_for_verify, signing_input, ec.ECDSA(hashes.SHA256()))
+        else:
+          errors.append(f"Unsupported bind JWS algorithm for verification: {bind_alg}")
+      except InvSig:
+        errors.append("bind JWS signature verification failed")
+      except Exception as sig_error:
+        errors.append(f"bind JWS signature verification error: {sig_error}")
+
+  return errors
+
+
+def _compute_jwk_thumbprint_from_certificate(cert: x509.Certificate) -> Optional[str]:
+  """Compute RFC 7638 JWK thumbprint from a certificate's public key."""
+  pub = cert.public_key()
+  return _compute_jwk_thumbprint_from_public_key(pub)
+
+
+def _compute_jwk_thumbprint_from_public_key(pub) -> Optional[str]:
+  """Compute RFC 7638 JWK thumbprint from a public key object."""
+  import json
+
+  try:
+    if isinstance(pub, ec.EllipticCurvePublicKey):
+      numbers = pub.public_numbers()
+      curve_name = pub.curve.name
+      crv = {"secp256r1": "P-256", "secp384r1": "P-384", "secp521r1": "P-521"}.get(curve_name)
+      if not crv:
+        return None
+      x_bytes = numbers.x.to_bytes((pub.key_size + 7) // 8, "big")
+      y_bytes = numbers.y.to_bytes((pub.key_size + 7) // 8, "big")
+      x_b64 = base64.urlsafe_b64encode(x_bytes).rstrip(b"=").decode("ascii")
+      y_b64 = base64.urlsafe_b64encode(y_bytes).rstrip(b"=").decode("ascii")
+      thumbprint_input = json.dumps(
+        {"crv": crv, "kty": "EC", "x": x_b64, "y": y_b64},
+        separators=(",", ":"), sort_keys=True,
+      )
+    elif isinstance(pub, rsa.RSAPublicKey):
+      numbers = pub.public_numbers()
+      e_bytes = numbers.e.to_bytes((numbers.e.bit_length() + 7) // 8, "big")
+      n_bytes = numbers.n.to_bytes((numbers.n.bit_length() + 7) // 8, "big")
+      e_b64 = base64.urlsafe_b64encode(e_bytes).rstrip(b"=").decode("ascii")
+      n_b64 = base64.urlsafe_b64encode(n_bytes).rstrip(b"=").decode("ascii")
+      thumbprint_input = json.dumps(
+        {"e": e_b64, "kty": "RSA", "n": n_b64},
+        separators=(",", ":"), sort_keys=True,
+      )
+    else:
+      return None
+    return base64.urlsafe_b64encode(
+      hashlib.sha256(thumbprint_input.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+  except Exception:
+    return None
+
+
+def _compute_jwk_thumbprint_from_jwk_dict(jwk: dict) -> Optional[str]:
+  """Compute RFC 7638 JWK thumbprint from a JWK dictionary."""
+  import json
+
+  try:
+    kty = jwk.get("kty", "")
+    if kty == "EC":
+      thumbprint_input = json.dumps(
+        {"crv": jwk["crv"], "kty": "EC", "x": jwk["x"], "y": jwk["y"]},
+        separators=(",", ":"), sort_keys=True,
+      )
+    elif kty == "RSA":
+      thumbprint_input = json.dumps(
+        {"e": jwk["e"], "kty": "RSA", "n": jwk["n"]},
+        separators=(",", ":"), sort_keys=True,
+      )
+    else:
+      return None
+    return base64.urlsafe_b64encode(
+      hashlib.sha256(thumbprint_input.encode("ascii")).digest()
+    ).rstrip(b"=").decode("ascii")
+  except (KeyError, Exception):
+    return None
+
+
 def _reconstruct_header_template_without_chain(parsed: ParsedHardwareAttestationHeader) -> str:
-  """Reconstruct the header value with chain= empty for self-referencing digest."""
+  """Reconstruct the self-canonical header value per RFC Section 5.2.
+
+  Per spec: field name lowercase, params in ABNF order, exactly one SP
+  after the colon and each semicolon, chain= empty, all other params
+  (including FWS-free bind) remain present.
+  """
   signed_header_names_str = ":".join(parsed.signed_header_names)
   template = (
     f"v={parsed.version}; typ={parsed.typ}; alg={parsed.alg}; "
@@ -210,6 +481,8 @@ def _reconstruct_header_template_without_chain(parsed: ParsedHardwareAttestation
   )
   if parsed.aid:
     template += f"; aid={parsed.aid}"
+  if parsed.bind:
+    template += f"; bind={parsed.bind}"
   return template
 
 
@@ -297,7 +570,7 @@ def _canonicalise_headers_for_direct_attestation(
       canon_name = entry[0].strip().lower()
       canon_value = _dkim_relaxed_header_value(entry[1])
       lines.append(f"{canon_name}:{canon_value}\r\n")
-    lines.append(f"hardware-attestation:{header_value_without_chain}")
+    lines.append(f"hardware-attestation: {header_value_without_chain}")
     return "".join(lines).encode("utf-8")
 
   lowered = {k.strip().lower(): v for k, v in email_headers.items()}
@@ -318,7 +591,7 @@ def _canonicalise_headers_for_direct_attestation(
     canon_value = _dkim_relaxed_header_value(lowered[extra_name])
     lines.append(f"{canon_name}:{canon_value}\r\n")
 
-  lines.append(f"hardware-attestation:{header_value_without_chain}")
+  lines.append(f"hardware-attestation: {header_value_without_chain}")
   return "".join(lines).encode("utf-8")
 
 
@@ -360,7 +633,7 @@ def _canonicalise_body_using_dkim_simple(body_bytes: bytes) -> bytes:
 
 def _base64url_decode(encoded_string: str) -> bytes:
   """Decode base64url (no padding) to bytes."""
-  padded = encoded_string + "=" * (4 - len(encoded_string) % 4)
+  padded = encoded_string + "=" * ((4 - len(encoded_string) % 4) % 4)
   return base64.urlsafe_b64decode(padded)
 
 
@@ -498,16 +771,58 @@ def _asn1_read_tag_length(data: bytes, offset: int) -> tuple:
   return (tag, length_value, offset)
 
 
+_SHA256_OID_BYTES = bytes([0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01])
+
+
+def _validate_cms_digest_algorithm_is_sha256(cms_der_bytes: bytes) -> Optional[str]:
+  """Check that the CMS SignedData digestAlgorithms set includes SHA-256.
+
+  Per RFC Section 5.5: SignedData digestAlgorithms set MUST identify SHA-256.
+  Returns None on success, or an error string.
+  """
+  try:
+    offset = 0
+    _tag, length, value_offset = _asn1_read_tag_length(cms_der_bytes, offset)
+    content_info_bytes = cms_der_bytes[value_offset:value_offset + length]
+
+    inner_offset = 0
+    _oid_tag, oid_len, oid_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
+    inner_offset = oid_val_offset + oid_len
+
+    _explicit_tag, explicit_len, explicit_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
+    signed_data_bytes = content_info_bytes[explicit_val_offset:explicit_val_offset + explicit_len]
+
+    _sd_tag, _sd_len, sd_val_offset = _asn1_read_tag_length(signed_data_bytes, 0)
+    sd_content = signed_data_bytes[sd_val_offset:sd_val_offset + _sd_len]
+
+    pos = 0
+    _version_tag, version_len, version_val_offset = _asn1_read_tag_length(sd_content, pos)
+    pos = version_val_offset + version_len
+
+    if pos < len(sd_content):
+      digest_set_tag, digest_set_len, digest_set_val_offset = _asn1_read_tag_length(sd_content, pos)
+      if digest_set_tag == 0x31:
+        digest_algorithms_bytes = sd_content[digest_set_val_offset:digest_set_val_offset + digest_set_len]
+        if _SHA256_OID_BYTES in digest_algorithms_bytes:
+          return None
+        return "CMS digestAlgorithms set does not include SHA-256 (required by RFC Section 5.5)"
+  except Exception:
+    pass
+  return None
+
+
 def _validate_certificate_chain(
   chain: List[x509.Certificate],
   trusted_roots: List[x509.Certificate],
 ) -> Optional[str]:
-  """Validate that each cert in the chain is signed by the next, ending at a trusted root.
+  """Validate cert chain: signatures, validity periods, basic constraints, trust anchor.
 
   Returns None on success, or an error string on failure.
   """
   if not chain:
     return "Certificate chain is empty"
+
+  import datetime
 
   trusted_root_fingerprints = set()
   for root in trusted_roots:
@@ -519,6 +834,33 @@ def _validate_certificate_chain(
       trusted_root_fingerprints.add(pub_der)
     except Exception:
       pass
+
+  now = datetime.datetime.now(datetime.timezone.utc)
+
+  for i, cert in enumerate(chain):
+    if cert.not_valid_before_utc > now:
+      return f"Certificate at position {i} is not yet valid (notBefore={cert.not_valid_before_utc})"
+    if cert.not_valid_after_utc < now:
+      return f"Certificate at position {i} has expired (notAfter={cert.not_valid_after_utc})"
+
+  for i in range(1, len(chain)):
+    intermediate_cert = chain[i]
+    try:
+      basic_constraints = intermediate_cert.extensions.get_extension_for_class(
+        x509.BasicConstraints
+      )
+      if not basic_constraints.value.ca:
+        return f"Certificate at position {i} has basicConstraints CA:FALSE (must be CA)"
+    except x509.ExtensionNotFound:
+      pass
+
+  leaf = chain[0]
+  try:
+    key_usage = leaf.extensions.get_extension_for_class(x509.KeyUsage)
+    if not key_usage.value.digital_signature:
+      return f"Leaf certificate lacks digitalSignature keyUsage"
+  except x509.ExtensionNotFound:
+    pass
 
   for i in range(len(chain) - 1):
     child = chain[i]
@@ -589,9 +931,13 @@ def _verify_signature_against_certificate(
         return f"Certificate has {type(public_key).__name__}, expected RSA for PS256"
       public_key.verify(
         signature_bytes, attestation_input_72_bytes,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.AUTO),
         hashes.SHA256(),
       )
+    elif algorithm_name == "EdDSA":
+      if not isinstance(public_key, ed25519.Ed25519PublicKey):
+        return f"Certificate has {type(public_key).__name__}, expected Ed25519 for EdDSA"
+      public_key.verify(signature_bytes, attestation_input_72_bytes)
     else:
       return f"Unsupported algorithm: {algorithm_name}"
   except InvalidSignature:

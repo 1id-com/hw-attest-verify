@@ -1,7 +1,7 @@
 """
 Issuer public key discovery for Hardware-Trust-Proof (Mode 2) verification.
 
-RFC: draft-drake-email-hardware-attestation-00, Section 6.1
+RFC: draft-drake-email-hardware-attestation-03, Section 4
 
 Two discovery mechanisms, tried in order:
   1. DNS TXT record at _hwattest.{domain} (preferred, no HTTPS fetch needed)
@@ -144,13 +144,7 @@ def _discover_key_via_https_jwks(
       continue
 
   if kid is not None:
-    for jwk in keys:
-      if jwk.get("kty") != "EC" or jwk.get("crv") != "P-256":
-        continue
-      try:
-        return _load_ec_public_key_from_jwk(jwk)
-      except Exception:
-        continue
+    logger.debug("No JWK matched kid=%s in JWKS from %s", kid, jwks_url)
 
   return None
 
@@ -158,7 +152,7 @@ def _discover_key_via_https_jwks(
 def _load_ec_public_key_from_base64_spki(b64_spki: str) -> Optional[ec.EllipticCurvePublicKey]:
   """Load an EC public key from base64-encoded SubjectPublicKeyInfo DER."""
   try:
-    padded = b64_spki + "=" * (4 - len(b64_spki) % 4)
+    padded = b64_spki + "=" * ((4 - len(b64_spki) % 4) % 4)
     der_bytes = base64.b64decode(padded)
     key = load_der_public_key(der_bytes)
     if isinstance(key, ec.EllipticCurvePublicKey):
@@ -173,8 +167,8 @@ def _load_ec_public_key_from_jwk(jwk: dict) -> ec.EllipticCurvePublicKey:
   x_b64 = jwk["x"]
   y_b64 = jwk["y"]
 
-  x_bytes = base64.urlsafe_b64decode(x_b64 + "=" * (4 - len(x_b64) % 4))
-  y_bytes = base64.urlsafe_b64decode(y_b64 + "=" * (4 - len(y_b64) % 4))
+  x_bytes = base64.urlsafe_b64decode(x_b64 + "=" * ((4 - len(x_b64) % 4) % 4))
+  y_bytes = base64.urlsafe_b64decode(y_b64 + "=" * ((4 - len(y_b64) % 4) % 4))
 
   public_numbers = ec.EllipticCurvePublicNumbers(
     x=int.from_bytes(x_bytes, "big"),

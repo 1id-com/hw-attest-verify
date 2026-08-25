@@ -1,7 +1,7 @@
 """
 Mode 2 verification: Hardware-Trust-Proof header (SD-JWT with selective disclosure).
 
-RFC: draft-drake-email-hardware-attestation-00, Section 6
+RFC: draft-drake-email-hardware-attestation-03, Section 6
 
 Verification steps (RFC Section 6.5):
   1. Parse the SD-JWT presentation (header.payload.signature~disclosure1~...)
@@ -38,24 +38,16 @@ _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = [
 
 
 def _unfold_mime_header_value(raw_value: str) -> str:
-  """Remove RFC 5322 header folding from a structured header value.
+  """Remove RFC 5322 header folding from an SD-JWT compact header value.
 
-  Handles three scenarios:
-    1. Raw wire-format: CRLF + WSP (RFC 5322 folding)
-    2. Partially unfolded by email libraries: LF + WSP
-    3. Fully unfolded by email libraries: only the leading WSP remains
-       (e.g. Python email.policy.default converts "\\n\\t" to "\\t")
-
-  For SD-JWT and structured parameters, the folding whitespace is never
-  part of the value content, so we collapse all runs of SP/HTAB that
-  appear after unfolding into nothing.
+  SD-JWT compact serialization (header.payload.sig~disc1~...) never
+  contains whitespace, so after RFC 5322 unfolding we strip ALL WSP.
   """
   import re
-  unfolded = raw_value.replace("\r\n\t", "").replace("\r\n ", "")
-  unfolded = unfolded.replace("\n\t", "").replace("\n ", "")
-  unfolded = re.sub(r"[ \t]{2,}", "", unfolded)
-  unfolded = unfolded.replace("\t", "")
-  return unfolded
+  unfolded = re.sub(r"\r\n([ \t]+)", r"\1", raw_value)
+  unfolded = re.sub(r"\n([ \t]+)", r"\1", unfolded)
+  unfolded = re.sub(r"[ \t]+", "", unfolded)
+  return unfolded.strip()
 
 _DEFAULT_MAX_TOKEN_LIFETIME_SECONDS = 3600
 _DEFAULT_MAX_TIMESTAMP_SKEW_SECONDS = 300
@@ -86,6 +78,7 @@ def verify_hardware_trust_proof(
   max_token_lifetime_seconds: int = _DEFAULT_MAX_TOKEN_LIFETIME_SECONDS,
   reference_time_unix: Optional[int] = None,
   issuer_public_key_override: Optional[ec.EllipticCurvePublicKey] = None,
+  skip_time_checks: bool = False,
 ) -> Mode2VerificationResult:
   """Verify a Mode 2 Hardware-Trust-Proof header.
 
@@ -147,8 +140,14 @@ def verify_hardware_trust_proof(
   result.issuer = issuer
 
   jwt_typ = jwt_header.get("typ", "")
-  if jwt_typ and jwt_typ != "airs-email+sd-jwt":
+  if not jwt_typ:
+    failure_reasons.append("Missing typ header (required: 'airs-email+sd-jwt')")
+  elif jwt_typ != "airs-email+sd-jwt":
     failure_reasons.append(f"Unexpected typ header: {jwt_typ!r} (expected 'airs-email+sd-jwt')")
+
+  sd_alg = jwt_payload.get("_sd_alg", "")
+  if sd_alg and sd_alg != "sha-256":
+    failure_reasons.append(f"Unsupported _sd_alg: {sd_alg!r} (expected 'sha-256')")
 
   algorithm = jwt_header.get("alg", "")
   if algorithm != "ES256":
@@ -157,22 +156,25 @@ def verify_hardware_trust_proof(
   iat = jwt_payload.get("iat")
   exp = jwt_payload.get("exp")
 
-  if iat is not None:
+  if iat is None:
+    failure_reasons.append("Missing iat claim (required per RFC Section 5.2)")
+  else:
     result.issued_at_unix = int(iat)
-    iat_drift = abs(reference_time_unix - int(iat))
-    if iat_drift > max_timestamp_skew_seconds:
-      failure_reasons.append(
-        f"iat is {iat_drift}s from reference time (max: {max_timestamp_skew_seconds}s)"
-      )
+    if not skip_time_checks:
+      iat_drift = abs(reference_time_unix - int(iat))
+      if iat_drift > max_timestamp_skew_seconds:
+        failure_reasons.append(
+          f"iat is {iat_drift}s from reference time (max: {max_timestamp_skew_seconds}s)"
+        )
 
   if exp is not None:
     result.expires_at_unix = int(exp)
-    if max_timestamp_skew_seconds < 999_999_000 and int(exp) < reference_time_unix:
+    if not skip_time_checks and int(exp) < reference_time_unix:
       failure_reasons.append(f"Token has expired (exp={exp}, now={reference_time_unix})")
 
   if iat is not None and exp is not None:
     token_lifetime = int(exp) - int(iat)
-    if max_timestamp_skew_seconds < 999_999_000 and token_lifetime > max_token_lifetime_seconds:
+    if not skip_time_checks and token_lifetime > max_token_lifetime_seconds:
       failure_reasons.append(
         f"Token lifetime {token_lifetime}s exceeds maximum {max_token_lifetime_seconds}s"
       )
@@ -182,7 +184,6 @@ def verify_hardware_trust_proof(
     result.failure_reason = failure_reasons[0]
     return result
 
-  header_b64 = header_value.strip().split("~")[0].rsplit(".", 1)[0].rsplit(".", 1)[0]
   jwt_compact = header_value.strip().split("~")[0]
   jwt_parts = jwt_compact.split(".")
   if len(jwt_parts) != 3:
@@ -224,7 +225,9 @@ def verify_hardware_trust_proof(
   nonce = jwt_payload.get("nonce")
   if nonce is None:
     failure_reasons.append("Missing nonce claim (required for message binding)")
-  elif iat is not None:
+  elif iat is None:
+    failure_reasons.append("Cannot verify nonce: iat is absent (both are required)")
+  else:
     expected_nonce = _compute_message_binding_nonce(
       email_headers, body, int(iat),
       ordered_header_pairs=ordered_header_pairs,
@@ -242,8 +245,11 @@ def verify_hardware_trust_proof(
   else:
     result.trust_tier = str(disclosed_claims.get("trust_tier", jwt_payload.get("trust_tier", "")))
 
-  result.agent_identity_urn = str(jwt_payload.get("sub", ""))
-  result.is_identified_mode = bool(result.agent_identity_urn)
+  sub_from_disclosures = disclosed_claims.get("sub", "")
+  sub_from_payload = jwt_payload.get("sub", "")
+  resolved_sub = str(sub_from_disclosures or sub_from_payload)
+  result.agent_identity_urn = resolved_sub
+  result.is_identified_mode = bool(resolved_sub)
 
   if result.is_identified_mode and not failure_reasons:
     rdap_issuer = _resolve_issuer_via_rdap(result.agent_identity_urn)
@@ -255,7 +261,11 @@ def verify_hardware_trust_proof(
           f"RDAP currentIssuer {rdap_issuer!r} does not match JWT iss {issuer!r}"
         )
     else:
-      pass
+      import logging
+      logging.getLogger("hw_attest_verify.mode2").info(
+        "RDAP lookup for %s returned no result (issuer not verified via RDAP)",
+        result.agent_identity_urn,
+      )
 
   if failure_reasons:
     result.failure_reasons = failure_reasons
@@ -295,7 +305,7 @@ def _parse_sd_jwt_presentation(
 
 
 def _base64url_decode_to_bytes(encoded: str) -> bytes:
-  padded = encoded + "=" * (4 - len(encoded) % 4)
+  padded = encoded + "=" * ((4 - len(encoded) % 4) % 4)
   return base64.urlsafe_b64decode(padded)
 
 
@@ -331,12 +341,13 @@ def _verify_es256_signature(
   """
   from cryptography.exceptions import InvalidSignature
 
+  if len(signature_bytes) != 64:
+    return (
+      f"ES256 JWS signature must be exactly 64 bytes (raw R||S), "
+      f"got {len(signature_bytes)} bytes"
+    )
   try:
-    if len(signature_bytes) == 64:
-      der_signature = _raw_rs_to_der(signature_bytes)
-    else:
-      der_signature = signature_bytes
-
+    der_signature = _raw_rs_to_der(signature_bytes)
     public_key.verify(der_signature, signing_input, ec.ECDSA(hashes.SHA256()))
     return None
   except InvalidSignature:
@@ -526,10 +537,9 @@ def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
   import urllib.request
   import urllib.error
 
-  urn_path = agent_identity_urn
-  if urn_path.startswith("urn:aid:"):
-    urn_path = urn_path[len("urn:aid:"):]
+  from urllib.parse import quote as url_quote
 
+  urn_path = url_quote(agent_identity_urn, safe="")
   rdap_url = f"{_AIRS_RDAP_BASE_URL}/rdap/aid_identity/{urn_path}"
 
   try:
