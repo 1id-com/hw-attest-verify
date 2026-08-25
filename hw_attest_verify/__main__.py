@@ -30,8 +30,8 @@ from .mode2 import verify_hardware_trust_proof, Mode2VerificationResult
 
 
 def _unfold_rfc5322_header_value(folded_value: str) -> str:
-  """Unfold an RFC 5322 header value by removing CRLF+WSP continuations."""
-  return re.sub(r'\r?\n[ \t]', '', folded_value)
+  """Unfold an RFC 5322 header value per Section 2.2.3: remove CRLF, keep WSP."""
+  return re.sub(r'\r?\n(?=[ \t])', '', folded_value)
 
 
 def _extract_email_headers_as_ordered_pairs(msg: email.message.Message) -> list:
