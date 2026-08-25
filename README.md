@@ -2,7 +2,7 @@
 
 Verification library for RFC `Hardware-Attestation` and `Hardware-Trust-Proof` email headers.
 
-Receiving mail servers use this library to verify that an email was sent from hardware-attested identity, as defined in [draft-drake-email-hardware-attestation-00](https://1id.com/rfc/).
+Receiving mail servers use this library to verify that an email was sent from a hardware-attested identity, as defined in [draft-drake-email-hardware-attestation-03](https://1id.com/rfc/).
 
 ## Installation
 
@@ -110,7 +110,7 @@ Install `dnspython` for DNS discovery: `pip install hw-attest-verify[dns]`
 
 ## RFC Reference
 
-[draft-drake-email-hardware-attestation-00](https://1id.com/rfc/draft-drake-email-hardware-attestation-00.html) -- Hardware Attestation for Email Sender Verification
+[draft-drake-email-hardware-attestation-03](https://1id.com/rfc/draft-drake-email-hardware-attestation-03.html) -- Hardware Attestation for Email Sender Verification
 
 ## License
 
@@ -132,7 +132,7 @@ package.
 | 6.3 Message-binding nonce (fixed 5-header set) | `hw_attest_verify/mode2.py` `_compute_message_binding_nonce` (From,To,Subject,Date,Message-ID, in order; no oversigning) |
 | 7 Acceptable algorithms | `mode1.py` (ES256/RS256/PS256), `mode2.py` (ES256 only); source of truth published at C6 |
 | 8 Issuer key discovery (`_hwattest` TXT, SPKI `p=`, JWKS fallback) | `hw_attest_verify/issuer_key_discovery.py` |
-| 6.5 Authentication-Results (header.issuer) | `hw_attest_verify/__main__.py` `_format_mode1/2_auth_results_line` |
+| 8 IANA A-R: `hw-attest` (header.typ/alg/tier/aid), `hw-trust` (header.mode/tier/issuer/aid) | `hw_attest_verify/__main__.py` `_format_mode1/2_auth_results_line` |
 | CLI (`--auth-results --no-time-check --hostname`) | `hw_attest_verify/__main__.py` `verify_email_from_raw` |
 
 Verified end-to-end by gates G4.2 (tamper suite), G4.3 (live 5-tier

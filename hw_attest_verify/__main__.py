@@ -91,23 +91,22 @@ def _format_mode2_auth_results_line(
 ) -> str:
   """Format a Mode 2 result as an Authentication-Results header line.
 
-  Emits header.issuer (email-03): the property is the Issuer domain, not
-  "registry" -- in the companion architecture "Registry" is the distinct
-  Registry Operator role, while the party that signs the trust proof is
-  the Issuer (Registrar). See draft-drake-email-hardware-attestation-03.
+  Per draft-drake-email-hardware-attestation-03 Section 8 (IANA):
+    hw-trust=pass header.mode=identified header.tier=sovereign
+      header.issuer=https://1id.com header.aid=urn:aid:global:id-...
   """
   status = "pass" if mode2_result.is_valid else "fail"
   tier = mode2_result.trust_tier or "unknown"
-  issuer_domain = "1id.com"
-  issuer = mode2_result.issuer
-  if issuer and "://" in issuer:
-    from urllib.parse import urlparse
-    issuer_domain = urlparse(issuer).hostname or issuer_domain
+  mode_value = "identified" if mode2_result.is_identified_mode else "hidden"
+
   line = (
     f"Authentication-Results: {hostname}; hw-trust={status}"
-    f" header.trust_tier={tier}"
-    f" header.issuer={issuer_domain}"
+    f" header.mode={mode_value}"
+    f" header.tier={tier}"
+    f" header.issuer={mode2_result.issuer or 'unknown'}"
   )
+  if mode2_result.is_identified_mode and mode2_result.agent_identity_urn:
+    line += f" header.aid={mode2_result.agent_identity_urn}"
   if not mode2_result.is_valid and mode2_result.failure_reason:
     line += f" ({mode2_result.failure_reason})"
   return line
