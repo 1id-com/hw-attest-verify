@@ -41,7 +41,12 @@ def _extract_email_headers_as_ordered_pairs(msg: email.message.Message) -> list:
   for DKIM-compatible bottom-up header selection (RFC 6376 Section 3.7).
   Values are unfolded per RFC 5322 Section 2.2.3.
   """
-  return [(key, _unfold_rfc5322_header_value(msg[key])) for key in msg.keys()]
+  # raw_items() preserves the value belonging to each duplicate instance;
+  # msg[key] would return the first instance repeatedly and break bottom-up h=.
+  return [
+    (key, _unfold_rfc5322_header_value(value))
+    for key, value in msg.raw_items()
+  ]
 
 
 def _extract_email_headers_as_dict(msg: email.message.Message) -> dict:
@@ -50,8 +55,8 @@ def _extract_email_headers_as_dict(msg: email.message.Message) -> dict:
   Values are unfolded per RFC 5322 Section 2.2.3.
   """
   headers = {}
-  for key in msg.keys():
-    headers[key.strip().lower()] = _unfold_rfc5322_header_value(msg[key])
+  for key, value in msg.raw_items():
+    headers[key.strip().lower()] = _unfold_rfc5322_header_value(value)
   return headers
 
 
@@ -208,10 +213,8 @@ def verify_email_from_raw(
   if skip_time_checks:
     time_kwargs["max_timestamp_skew_seconds"] = 999_999_999
 
-  _SINGLETON_HEADERS = {
-    "hardware-attestation", "hardware-trust-proof",
-    "from", "to", "subject", "date", "message-id",
-  }
+  from .parse import SINGLETON_HEADER_FIELD_NAMES_FOR_VERIFICATION
+  _SINGLETON_HEADERS = SINGLETON_HEADER_FIELD_NAMES_FOR_VERIFICATION
   header_name_counts: dict = {}
   for name, _value in ordered_header_pairs:
     lowered_name = name.strip().lower()
@@ -371,4 +374,3 @@ def main() -> None:
 
 if __name__ == "__main__":
   main()
-

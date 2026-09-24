@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hw-attest-verify"
-version = "1.0.3"
+version = "2.0.0"
 description = "Verification library for RFC Hardware-Attestation and Hardware-Trust-Proof email headers"
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,7 +21,8 @@ classifiers = [
   "Topic :: Communications :: Email",
 ]
 dependencies = [
-  "cryptography>=41.0",
+  # >=42: Certificate.not_valid_before_utc / not_valid_after_utc (path validation)
+  "cryptography>=42.0",
 ]
 
 [project.optional-dependencies]

@@ -125,12 +125,12 @@ package.
 
 | Draft section | Implementing file(s) |
 |---|---|
-| 5 Mode 1 Direct Hardware Attestation (verify) | `hw_attest_verify/mode1.py` (CMS parse, chain walk, digest reconstruction, per-typ signature rule) |
+| 5 Mode 1 Direct Hardware Attestation (verify) | `hw_attest_verify/mode1.py` (verification flow, digest reconstruction, signature check with the SignerInfo-named certificate; PS256 salt 32), `hw_attest_verify/cms_signed_data_profile.py` (strict CMS SignedData profile + CMS Algorithm Mapping), `hw_attest_verify/signer_certificate_path_building_and_validation.py` (path built from the signer to a trusted root, RFC 5280 CA rules) |
 | 5.2 Attestation digest / h-hash + DKIM canon | `hw_attest_verify/mode1.py` `_compute_attestation_digest`, `_canonicalise_headers_for_direct_attestation`, `_select_headers_bottom_up_per_dkim` |
 | 5 header grammar (v=/typ=/alg=/h=/bh=/ts=/chain=/aid=) | `hw_attest_verify/parse.py` |
 | 6 Mode 2 SD-JWT Trust Proof (verify) | `hw_attest_verify/mode2.py` (SD-JWT parse, disclosure hashes, ES256 sig) |
-| 6.3 Message-binding nonce (fixed 5-header set) | `hw_attest_verify/mode2.py` `_compute_message_binding_nonce` (From,To,Subject,Date,Message-ID, in order; no oversigning) |
-| 7 Acceptable algorithms | `mode1.py` (ES256/RS256/PS256), `mode2.py` (ES256 only); source of truth published at C6 |
+| 6.3 Message-binding nonce (fixed nine-field set) | `hw_attest_verify/mode2.py` `_compute_message_binding_nonce` (From,To,Subject,Date,Message-ID,Reply-To,MIME-Version,Content-Type,Content-Transfer-Encoding, in order; absent fields contribute nothing; no oversigning; a duplicated field fails) |
+| 7 Acceptable algorithms | `cms_signed_data_profile.py` + `mode1.py` (ES256/RS256/PS256), `mode2.py` (ES256 only); source of truth published at C6 |
 | 8 Issuer key discovery (`_hwattest` TXT, SPKI `p=`, JWKS fallback) | `hw_attest_verify/issuer_key_discovery.py` |
 | 8 IANA A-R: `hw-attest` (header.typ/alg/tier/aid), `hw-trust` (header.mode/tier/issuer/aid) | `hw_attest_verify/__main__.py` `_format_mode1/2_auth_results_line` |
 | CLI (`--auth-results --no-time-check --hostname`) | `hw_attest_verify/__main__.py` `verify_email_from_raw` |

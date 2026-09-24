@@ -17,7 +17,6 @@ Verification steps (RFC Section 6.5):
 from __future__ import annotations
 
 import base64
-import email.header
 import hashlib
 import json
 import struct
@@ -32,9 +31,9 @@ from cryptography.hazmat.primitives import hashes, serialization
 from .issuer_key_discovery import discover_issuer_public_key
 
 
-_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = [
-  "from", "to", "subject", "date", "message-id",
-]
+from .parse import ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER, find_duplicate_singleton_header_field_names
+
+_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = list(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER)
 
 
 def _unfold_mime_header_value(raw_value: str) -> str:
@@ -108,6 +107,14 @@ def verify_hardware_trust_proof(
 
   if reference_time_unix is None:
     reference_time_unix = int(time.time())
+
+  duplicate_singleton_names = find_duplicate_singleton_header_field_names(ordered_header_pairs)
+  if duplicate_singleton_names:
+    result.failure_reason = (
+      f"Duplicate singleton headers (permerror): {', '.join(duplicate_singleton_names)}"
+    )
+    result.failure_reasons = [result.failure_reason]
+    return result
 
   header_value = _unfold_mime_header_value(header_value)
 
@@ -410,31 +417,14 @@ def _verify_and_extract_disclosures(
   return disclosed_claims, error_messages
 
 
-def _decode_rfc2047_encoded_words_to_unicode(raw_header_value: str) -> str:
-  """Decode RFC 2047 encoded-words to plain Unicode before canonicalization.
-
-  MTAs may re-encode RFC 2047 differently (splitting across fold points,
-  or consolidating multiple encoded-words). Decoding before canonicalization
-  ensures the attestation hash is independent of encoding representation.
-  """
-  try:
-    decoded_parts = email.header.decode_header(raw_header_value)
-    return str(email.header.make_header(decoded_parts))
-  except Exception:
-    return raw_header_value
-
-
-def _dkim_relaxed_header_value(raw_value: str) -> str:
-  """RFC 6376 Section 3.4.2 relaxed header canonicalization (value part).
-
-  Pre-step: Decode RFC 2047 encoded-words to Unicode, then normalize.
-  """
+def _canonicalise_header_value_using_dkim2_header_hash_rules(raw_value: str) -> str:
+  """Apply DKIM2 -06 Section 6.2 to a selected Mode-2 header value."""
   import re
-  decoded = _decode_rfc2047_encoded_words_to_unicode(raw_value)
-  normalized = decoded.replace("\r\n", "\n").replace("\n", "\r\n")
-  unfolded = re.sub(r"\r\n[ \t]", " ", normalized)
+  # Encoded words remain in their transmitted form because DKIM2 hashes the
+  # header field octets after only its specified case and WSP operations.
+  unfolded = re.sub(r"\r?\n(?=[ \t])", "", raw_value)
   compressed = re.sub(r"[ \t]+", " ", unfolded)
-  return compressed.strip()
+  return compressed.strip(" \t")
 
 
 def _canonicalise_body_using_dkim_simple(body_bytes: bytes) -> bytes:
@@ -489,8 +479,8 @@ def _compute_message_binding_nonce(
 
   Uses the SD-JWT's iat for ts-bytes, per the RFC verification algorithm.
 
-  email-03 Mode 2 covers a FIXED set: exactly From, To, Subject, Date,
-  Message-ID, in THAT order, each once -- no oversigning and no bottom-up
+  email-03 Mode 2 covers a FIXED set: the nine always-covered fields
+  (ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER), in THAT order, each once -- no oversigning and no bottom-up
   selection (that is a Mode 1 behavior; Mode 1 carries an explicit h=
   list, Mode 2 does not, so its covered set must be fixed and known to
   both sides). ordered_header_pairs is accepted for signature
@@ -501,7 +491,9 @@ def _compute_message_binding_nonce(
   lines: List[str] = []
   for required_name in _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING:
     if required_name in lowered:
-      canon_value = _dkim_relaxed_header_value(lowered[required_name])
+      canon_value = _canonicalise_header_value_using_dkim2_header_hash_rules(
+        lowered[required_name]
+      )
       lines.append(f"{required_name}:{canon_value}\r\n")
 
   lines.append("hardware-trust-proof:")
@@ -550,4 +542,3 @@ def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
       return aid_data.get("currentIssuer")
   except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError):
     return None
-

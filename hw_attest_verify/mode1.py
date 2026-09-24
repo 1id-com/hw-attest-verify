@@ -5,16 +5,18 @@ RFC: draft-drake-email-hardware-attestation-03, Section 5
 
 Verification steps:
   1. Parse the header parameters (v, typ, alg, h, bh, ts, chain)
-  2. Decode the CMS SignedData from the chain parameter
+  2. Decode the CMS SignedData strictly against the Version 1 profile and
+     check its algorithm identifiers against alg (cms_signed_data_profile.py)
   3. Recompute the 72-byte attestation-input (h-hash || bh-raw || ts-bytes)
-  4. Verify the CMS signature using the leaf certificate's public key
-  5. Validate the certificate chain
+  4. Verify the CMS signature with the certificate SignerInfo.sid names
+  5. Build and validate the certificate path from that signer certificate
+     to a trusted root (signer_certificate_path_building_and_validation.py)
 """
 
 from __future__ import annotations
 
 import base64
-import email.header
+import datetime
 import hashlib
 import re
 import struct
@@ -23,16 +25,29 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from cryptography import x509
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec, ed25519, rsa, padding
 
-from .parse import ParsedHardwareAttestationHeader, parse_hardware_attestation_header
+from .cms_signed_data_profile import (
+  Mode1CmsProfileViolation,
+  check_cms_algorithms_match_header_alg_and_signer_key,
+  decode_mode1_detached_signed_data_strictly,
+  find_signer_certificate_named_by_signer_info,
+  load_every_certificate_in_signed_data_failing_closed,
+)
+from .parse import (
+  parse_hardware_attestation_header,
+  replace_single_chain_tag_value_with_empty_value_preserving_other_text,
+)
+from .signer_certificate_path_building_and_validation import (
+  build_and_validate_certificate_path_from_signer_to_trusted_root,
+)
 
 
-_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = [
-  "from", "to", "subject", "date", "message-id",
-]
+from .parse import ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER, find_duplicate_singleton_header_field_names
+
+_MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = list(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER)
 
 _DEFAULT_MAX_TIMESTAMP_SKEW_SECONDS = 300
 
@@ -90,6 +105,10 @@ def verify_hardware_attestation(
   result.timestamp_unix = parsed.ts
   result.agent_identity_urn = parsed.aid
 
+  # Reject grammar errors before interpreting values; legal FWS is handled by
+  # the individual tag grammar and is never globally stripped into validity.
+  failure_reasons.extend(parsed.parse_errors)
+
   if parsed.version != 1:
     failure_reasons.append(f"Unsupported version: v={parsed.version} (expected v=1)")
 
@@ -115,7 +134,12 @@ def verify_hardware_attestation(
   if parsed.ts == 0:
     failure_reasons.append("Missing or invalid ts parameter")
 
-  _REQUIRED_SIGNED_HEADERS = {"from", "to", "subject", "date", "message-id"}
+  _REQUIRED_SIGNED_HEADERS = set(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER)
+  duplicate_singleton_names = find_duplicate_singleton_header_field_names(ordered_header_pairs)
+  if duplicate_singleton_names:
+    failure_reasons.append(
+      f"Duplicate singleton headers (permerror): {', '.join(duplicate_singleton_names)}"
+    )
   signed_names_lower = {n.strip().lower() for n in parsed.signed_header_names}
   missing_required_headers = _REQUIRED_SIGNED_HEADERS - signed_names_lower
   if missing_required_headers:
@@ -146,27 +170,35 @@ def verify_hardware_attestation(
     result.failure_reason = failure_reasons[0]
     return result
 
-  cms_digest_algorithm_validation_error = _validate_cms_digest_algorithm_is_sha256(chain_der_bytes)
-  if cms_digest_algorithm_validation_error:
-    failure_reasons.append(cms_digest_algorithm_validation_error)
-
-  extracted_certificates = _extract_certificates_from_cms_signed_data(chain_der_bytes)
-  if not extracted_certificates:
-    failure_reasons.append("No certificates found in CMS SignedData")
+  # AUD-F78: decode the chain= CMS strictly and fail closed on any deviation
+  # from the Version 1 profile (the old byte-search helpers skipped unknown
+  # structure and their SHA-256 check passed on unparseable input).
+  try:
+    decoded_signed_data = decode_mode1_detached_signed_data_strictly(chain_der_bytes)
+    signed_data_certificates = load_every_certificate_in_signed_data_failing_closed(decoded_signed_data)
+    signer_certificate = find_signer_certificate_named_by_signer_info(decoded_signed_data, signed_data_certificates)
+    check_cms_algorithms_match_header_alg_and_signer_key(
+      decoded_signed_data, parsed.alg, signer_certificate.public_key(), allow_eddsa=allow_eddsa,
+    )
+  except (Mode1CmsProfileViolation, ValueError, UnsupportedAlgorithm) as cms_profile_error:
+    failure_reasons.append(f"CMS SignedData does not match the Version 1 profile: {cms_profile_error}")
     result.failure_reasons = failure_reasons
     result.failure_reason = failure_reasons[0]
     return result
 
-  result.certificate_chain_length = len(extracted_certificates)
+  result.certificate_chain_length = len(signed_data_certificates)
 
-  extracted_signature_bytes = _extract_signature_from_cms_signed_data(chain_der_bytes)
-  if extracted_signature_bytes is None:
-    failure_reasons.append("Could not extract signature from CMS SignedData")
+  try:
+    header_value_without_chain_for_self_reference = (
+      replace_single_chain_tag_value_with_empty_value_preserving_other_text(
+        parsed.raw_header_value_with_original_tag_order
+      )
+    )
+  except ValueError as chain_self_reference_error:
+    failure_reasons.append(str(chain_self_reference_error))
     result.failure_reasons = failure_reasons
     result.failure_reason = failure_reasons[0]
     return result
-
-  header_value_without_chain_for_self_reference = _reconstruct_header_template_without_chain(parsed)
 
   attestation_input_72_bytes = _compute_attestation_input(
     email_headers=email_headers,
@@ -177,21 +209,20 @@ def verify_hardware_attestation(
     ordered_header_pairs=ordered_header_pairs,
   )
 
+  # RFC 5652 s5.3: the signature is checked with the certificate SignerInfo.sid
+  # names, not with whichever bundled certificate happens to verify it.
   leaf_certificate = None
-  for candidate_certificate in extracted_certificates:
-    verification_error = _verify_signature_against_certificate(
-      leaf_certificate=candidate_certificate,
-      signature_bytes=extracted_signature_bytes,
-      attestation_input_72_bytes=attestation_input_72_bytes,
-      algorithm_name=parsed.alg,
-    )
-    if verification_error is None:
-      leaf_certificate = candidate_certificate
-      break
-  if leaf_certificate is None:
+  verification_error = _verify_signature_against_certificate(
+    leaf_certificate=signer_certificate,
+    signature_bytes=decoded_signed_data.signature_bytes,
+    attestation_input_72_bytes=attestation_input_72_bytes,
+    algorithm_name=parsed.alg,
+  )
+  if verification_error is None:
+    leaf_certificate = signer_certificate
+  else:
     failure_reasons.append(
-      "Signature verification failed: no certificate in the CMS bundle "
-      "has a key that verifies the signature"
+      f"Signature verification failed with the SignerInfo signer certificate: {verification_error}"
     )
 
   if leaf_certificate is not None:
@@ -216,8 +247,16 @@ def verify_hardware_attestation(
       failure_reasons.append("Body hash (bh) does not match recomputed hash")
 
   if trusted_root_certificates:
-    chain_validation_error = _validate_certificate_chain(
-      extracted_certificates, trusted_root_certificates,
+    # AUD-F80/F82: build the path from the SignerInfo signer certificate by
+    # issuer name + signature (CertificateSet order means nothing) and apply
+    # the RFC 5280 CA rules to every issuing certificate, at reference time.
+    chain_validation_error = build_and_validate_certificate_path_from_signer_to_trusted_root(
+      signer_certificate=signer_certificate,
+      other_certificates_from_signed_data=[
+        certificate for certificate in signed_data_certificates if certificate is not signer_certificate
+      ],
+      trusted_root_certificates=trusted_root_certificates,
+      validation_time_utc=datetime.datetime.fromtimestamp(reference_time_unix, tz=datetime.timezone.utc),
     )
     if chain_validation_error:
       failure_reasons.append(f"Certificate chain validation failed: {chain_validation_error}")
@@ -466,26 +505,6 @@ def _compute_jwk_thumbprint_from_jwk_dict(jwk: dict) -> Optional[str]:
     return None
 
 
-def _reconstruct_header_template_without_chain(parsed: ParsedHardwareAttestationHeader) -> str:
-  """Reconstruct the self-canonical header value per RFC Section 5.2.
-
-  Per spec: field name lowercase, params in ABNF order, exactly one SP
-  after the colon and each semicolon, chain= empty, all other params
-  (including FWS-free bind) remain present.
-  """
-  signed_header_names_str = ":".join(parsed.signed_header_names)
-  template = (
-    f"v={parsed.version}; typ={parsed.typ}; alg={parsed.alg}; "
-    f"h={signed_header_names_str}; bh={parsed.bh}; ts={parsed.ts}; "
-    f"chain="
-  )
-  if parsed.aid:
-    template += f"; aid={parsed.aid}"
-  if parsed.bind:
-    template += f"; bind={parsed.bind}"
-  return template
-
-
 def _select_headers_bottom_up_per_dkim(
   header_names_from_h_tag: List[str],
   message_headers: List[tuple],
@@ -567,53 +586,61 @@ def _canonicalise_headers_for_direct_attestation(
     for entry in selected:
       if entry is None:
         continue
-      canon_name = entry[0].strip().lower()
-      canon_value = _dkim_relaxed_header_value(entry[1])
-      lines.append(f"{canon_name}:{canon_value}\r\n")
-    lines.append(f"hardware-attestation: {header_value_without_chain}")
+      lines.append(_canonicalise_selected_header_field_using_dkim2_header_hash_rules(
+        entry[0], entry[1]
+      ))
+    lines.append(_canonicalise_hardware_attestation_self_reference_using_dkim2_signature_rules(
+      header_value_without_chain
+    ))
     return "".join(lines).encode("utf-8")
 
+  # Without ordered instances, select by the SIGNED h= list (F44): each
+  # listed name contributes its (single) value if present, nothing if absent;
+  # repeated listings of a name select nothing more (no further instances).
   lowered = {k.strip().lower(): v for k, v in email_headers.items()}
   lines = []
-  for required_name in _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING:
-    if required_name not in lowered:
+  already_selected_names = set()
+  for listed_name in signed_header_names_from_h_tag or []:
+    lowered_listed_name = listed_name.strip().lower()
+    if lowered_listed_name in already_selected_names or lowered_listed_name not in lowered:
       continue
-    canon_name = required_name.strip().lower()
-    canon_value = _dkim_relaxed_header_value(lowered[required_name])
-    lines.append(f"{canon_name}:{canon_value}\r\n")
+    already_selected_names.add(lowered_listed_name)
+    lines.append(_canonicalise_selected_header_field_using_dkim2_header_hash_rules(
+      lowered_listed_name, lowered[lowered_listed_name]
+    ))
 
-  for extra_name in sorted(lowered.keys()):
-    if extra_name in _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING:
-      continue
-    if extra_name in ("hardware-attestation", "hardware-trust-proof"):
-      continue
-    canon_name = extra_name.strip().lower()
-    canon_value = _dkim_relaxed_header_value(lowered[extra_name])
-    lines.append(f"{canon_name}:{canon_value}\r\n")
-
-  lines.append(f"hardware-attestation: {header_value_without_chain}")
+  lines.append(_canonicalise_hardware_attestation_self_reference_using_dkim2_signature_rules(
+    header_value_without_chain
+  ))
   return "".join(lines).encode("utf-8")
 
 
-def _decode_rfc2047_encoded_words_to_unicode(raw_header_value: str) -> str:
-  """Decode RFC 2047 encoded-words to plain Unicode before canonicalization."""
-  try:
-    decoded_parts = email.header.decode_header(raw_header_value)
-    return str(email.header.make_header(decoded_parts))
-  except Exception:
-    return raw_header_value
+def _canonicalise_selected_header_field_using_dkim2_header_hash_rules(
+  raw_header_field_name: str,
+  raw_header_field_value: str,
+) -> str:
+  """Apply DKIM2 -06 Section 6.2 mechanics to one AIRS-selected field."""
+  lowercase_header_field_name = raw_header_field_name.strip(" \t").lower()
+  unfolded_header_field_value = re.sub(r"\r?\n(?=[ \t])", "", raw_header_field_value)
+  compressed_header_field_value = re.sub(r"[ \t]+", " ", unfolded_header_field_value)
+  header_field_value_without_colon_adjacent_or_trailing_wsp = (
+    compressed_header_field_value.strip(" \t")
+  )
+  return (
+    f"{lowercase_header_field_name}:"
+    f"{header_field_value_without_colon_adjacent_or_trailing_wsp}\r\n"
+  )
 
 
-def _dkim_relaxed_header_value(raw_value: str) -> str:
-  """RFC 6376 Section 3.4.2 relaxed header canonicalization (value part).
-
-  Pre-step: Decode RFC 2047 encoded-words to Unicode, then normalize.
-  """
-  decoded = _decode_rfc2047_encoded_words_to_unicode(raw_value)
-  normalized = decoded.replace("\r\n", "\n").replace("\n", "\r\n")
-  unfolded = re.sub(r"\r\n[ \t]", " ", normalized)
-  compressed = re.sub(r"[ \t]+", " ", unfolded)
-  return compressed.strip()
+def _canonicalise_hardware_attestation_self_reference_using_dkim2_signature_rules(
+  hardware_attestation_header_value_with_empty_chain: str,
+) -> str:
+  """Apply DKIM2 -06 Section 9.6 WSP deletion to the actual AIRS field."""
+  unfolded_header_value = re.sub(
+    r"\r?\n(?=[ \t])", "", hardware_attestation_header_value_with_empty_chain
+  )
+  header_value_without_wsp = re.sub(r"[ \t]+", "", unfolded_header_value)
+  return f"hardware-attestation:{header_value_without_wsp}\r\n"
 
 
 def _canonicalise_body_using_dkim_simple(body_bytes: bytes) -> bytes:
@@ -637,106 +664,8 @@ def _base64url_decode(encoded_string: str) -> bytes:
   return base64.urlsafe_b64decode(padded)
 
 
-def _extract_certificates_from_cms_signed_data(cms_der_bytes: bytes) -> List[x509.Certificate]:
-  """Extract certificates from a CMS SignedData DER structure.
-
-  Walks the ASN.1 structure to find the [0] IMPLICIT SET OF Certificate
-  within the SignedData SEQUENCE.
-  """
-  certificates: List[x509.Certificate] = []
-  try:
-    offset = 0
-    tag, length, value_offset = _asn1_read_tag_length(cms_der_bytes, offset)
-    content_info_bytes = cms_der_bytes[value_offset:value_offset + length]
-
-    inner_offset = 0
-    oid_tag, oid_len, oid_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    inner_offset = oid_val_offset + oid_len
-
-    if inner_offset >= len(content_info_bytes):
-      return certificates
-
-    explicit_tag, explicit_len, explicit_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    signed_data_bytes = content_info_bytes[explicit_val_offset:explicit_val_offset + explicit_len]
-
-    sd_offset = 0
-    sd_tag, sd_len, sd_val_offset = _asn1_read_tag_length(signed_data_bytes, sd_offset)
-    sd_content = signed_data_bytes[sd_val_offset:sd_val_offset + sd_len]
-
-    pos = 0
-    while pos < len(sd_content):
-      elem_tag, elem_len, elem_val_offset = _asn1_read_tag_length(sd_content, pos)
-      elem_end = elem_val_offset + elem_len
-
-      if elem_tag == 0xA0:
-        certs_content = sd_content[elem_val_offset:elem_end]
-        cert_pos = 0
-        while cert_pos < len(certs_content):
-          cert_tag, cert_len, cert_val_offset = _asn1_read_tag_length(certs_content, cert_pos)
-          cert_der = certs_content[cert_pos:cert_val_offset + cert_len]
-          try:
-            cert = x509.load_der_x509_certificate(cert_der)
-            certificates.append(cert)
-          except Exception:
-            pass
-          cert_pos = cert_val_offset + cert_len
-        break
-
-      pos = elem_end
-
-  except Exception:
-    pass
-
-  return certificates
-
-
-def _extract_signature_from_cms_signed_data(cms_der_bytes: bytes) -> Optional[bytes]:
-  """Extract the signature bytes from the SignerInfo in a CMS SignedData."""
-  try:
-    offset = 0
-    tag, length, value_offset = _asn1_read_tag_length(cms_der_bytes, offset)
-    content_info_bytes = cms_der_bytes[value_offset:value_offset + length]
-
-    inner_offset = 0
-    oid_tag, oid_len, oid_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    inner_offset = oid_val_offset + oid_len
-
-    explicit_tag, explicit_len, explicit_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    signed_data_bytes = content_info_bytes[explicit_val_offset:explicit_val_offset + explicit_len]
-
-    sd_tag, sd_len, sd_val_offset = _asn1_read_tag_length(signed_data_bytes, 0)
-    sd_content = signed_data_bytes[sd_val_offset:sd_val_offset + sd_len]
-
-    last_set_content = None
-    pos = 0
-    while pos < len(sd_content):
-      elem_tag, elem_len, elem_val_offset = _asn1_read_tag_length(sd_content, pos)
-      elem_end = elem_val_offset + elem_len
-      if elem_tag == 0x31:
-        last_set_content = sd_content[elem_val_offset:elem_end]
-      pos = elem_end
-
-    if last_set_content is None:
-      return None
-
-    signer_info_tag, si_len, si_val_offset = _asn1_read_tag_length(last_set_content, 0)
-    signer_info_content = last_set_content[si_val_offset:si_val_offset + si_len]
-
-    last_octet_string_value = None
-    si_pos = 0
-    while si_pos < len(signer_info_content):
-      si_tag, si_elem_len, si_elem_val_offset = _asn1_read_tag_length(signer_info_content, si_pos)
-      si_elem_end = si_elem_val_offset + si_elem_len
-      if si_tag == 0x04:
-        last_octet_string_value = signer_info_content[si_elem_val_offset:si_elem_end]
-      si_pos = si_elem_end
-
-    return last_octet_string_value
-
-  except Exception:
-    return None
-
-
+# Kept although Mode 1 now uses cms_signed_data_profile.py: the oneid-sdk
+# tests import this reader to inspect SDK-built CMS objects.
 def _asn1_read_tag_length(data: bytes, offset: int) -> tuple:
   """Read an ASN.1 tag and length at the given offset.
 
@@ -769,131 +698,6 @@ def _asn1_read_tag_length(data: bytes, offset: int) -> tuple:
     offset += 1
 
   return (tag, length_value, offset)
-
-
-_SHA256_OID_BYTES = bytes([0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01])
-
-
-def _validate_cms_digest_algorithm_is_sha256(cms_der_bytes: bytes) -> Optional[str]:
-  """Check that the CMS SignedData digestAlgorithms set includes SHA-256.
-
-  Per RFC Section 5.5: SignedData digestAlgorithms set MUST identify SHA-256.
-  Returns None on success, or an error string.
-  """
-  try:
-    offset = 0
-    _tag, length, value_offset = _asn1_read_tag_length(cms_der_bytes, offset)
-    content_info_bytes = cms_der_bytes[value_offset:value_offset + length]
-
-    inner_offset = 0
-    _oid_tag, oid_len, oid_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    inner_offset = oid_val_offset + oid_len
-
-    _explicit_tag, explicit_len, explicit_val_offset = _asn1_read_tag_length(content_info_bytes, inner_offset)
-    signed_data_bytes = content_info_bytes[explicit_val_offset:explicit_val_offset + explicit_len]
-
-    _sd_tag, _sd_len, sd_val_offset = _asn1_read_tag_length(signed_data_bytes, 0)
-    sd_content = signed_data_bytes[sd_val_offset:sd_val_offset + _sd_len]
-
-    pos = 0
-    _version_tag, version_len, version_val_offset = _asn1_read_tag_length(sd_content, pos)
-    pos = version_val_offset + version_len
-
-    if pos < len(sd_content):
-      digest_set_tag, digest_set_len, digest_set_val_offset = _asn1_read_tag_length(sd_content, pos)
-      if digest_set_tag == 0x31:
-        digest_algorithms_bytes = sd_content[digest_set_val_offset:digest_set_val_offset + digest_set_len]
-        if _SHA256_OID_BYTES in digest_algorithms_bytes:
-          return None
-        return "CMS digestAlgorithms set does not include SHA-256 (required by RFC Section 5.5)"
-  except Exception:
-    pass
-  return None
-
-
-def _validate_certificate_chain(
-  chain: List[x509.Certificate],
-  trusted_roots: List[x509.Certificate],
-) -> Optional[str]:
-  """Validate cert chain: signatures, validity periods, basic constraints, trust anchor.
-
-  Returns None on success, or an error string on failure.
-  """
-  if not chain:
-    return "Certificate chain is empty"
-
-  import datetime
-
-  trusted_root_fingerprints = set()
-  for root in trusted_roots:
-    try:
-      pub_der = root.public_key().public_bytes(
-        serialization.Encoding.DER,
-        serialization.PublicFormat.SubjectPublicKeyInfo,
-      )
-      trusted_root_fingerprints.add(pub_der)
-    except Exception:
-      pass
-
-  now = datetime.datetime.now(datetime.timezone.utc)
-
-  for i, cert in enumerate(chain):
-    if cert.not_valid_before_utc > now:
-      return f"Certificate at position {i} is not yet valid (notBefore={cert.not_valid_before_utc})"
-    if cert.not_valid_after_utc < now:
-      return f"Certificate at position {i} has expired (notAfter={cert.not_valid_after_utc})"
-
-  for i in range(1, len(chain)):
-    intermediate_cert = chain[i]
-    try:
-      basic_constraints = intermediate_cert.extensions.get_extension_for_class(
-        x509.BasicConstraints
-      )
-      if not basic_constraints.value.ca:
-        return f"Certificate at position {i} has basicConstraints CA:FALSE (must be CA)"
-    except x509.ExtensionNotFound:
-      pass
-
-  leaf = chain[0]
-  try:
-    key_usage = leaf.extensions.get_extension_for_class(x509.KeyUsage)
-    if not key_usage.value.digital_signature:
-      return f"Leaf certificate lacks digitalSignature keyUsage"
-  except x509.ExtensionNotFound:
-    pass
-
-  for i in range(len(chain) - 1):
-    child = chain[i]
-    parent = chain[i + 1]
-    parent_key = parent.public_key()
-
-    try:
-      if isinstance(parent_key, rsa.RSAPublicKey):
-        parent_key.verify(
-          child.signature, child.tbs_certificate_bytes,
-          padding.PKCS1v15(), child.signature_hash_algorithm,
-        )
-      elif isinstance(parent_key, ec.EllipticCurvePublicKey):
-        parent_key.verify(
-          child.signature, child.tbs_certificate_bytes,
-          ec.ECDSA(child.signature_hash_algorithm),
-        )
-      else:
-        return f"Unsupported key type at position {i+1}: {type(parent_key).__name__}"
-    except InvalidSignature:
-      return f"Certificate at position {i} is not signed by certificate at position {i+1}"
-    except Exception as chain_error:
-      return f"Error verifying cert at position {i}: {chain_error}"
-
-  root_cert = chain[-1]
-  root_pub_der = root_cert.public_key().public_bytes(
-    serialization.Encoding.DER,
-    serialization.PublicFormat.SubjectPublicKeyInfo,
-  )
-  if root_pub_der not in trusted_root_fingerprints:
-    return f"Chain root '{root_cert.subject}' is not in the set of trusted roots"
-
-  return None
 
 
 def _verify_signature_against_certificate(
@@ -931,7 +735,9 @@ def _verify_signature_against_certificate(
         return f"Certificate has {type(public_key).__name__}, expected RSA for PS256"
       public_key.verify(
         signature_bytes, attestation_input_72_bytes,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.AUTO),
+        # AUD-F79: the Version 1 PS256 profile fixes the salt at 32 octets
+        # (PSS.AUTO accepted any recoverable salt length).
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32),
         hashes.SHA256(),
       )
     elif algorithm_name == "EdDSA":
@@ -946,4 +752,3 @@ def _verify_signature_against_certificate(
     return f"Unexpected error during signature verification: {unexpected_error}"
 
   return None
-
