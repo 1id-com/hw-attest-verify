@@ -1,0 +1,110 @@
+Delivered-To: id-tzptt-rthrs-jfnnf-ppzbp@mailpal.com
+X-Spam-Status: No
+Received: from [172.22.1.89] (unknown [2001:8000:1bed:6d00:9d50:a62f:db25:6d9] (AS1221 Telstra Limited, AU))
+	(using TLSv1.3 with cipher TLS13_AES_256_GCM_SHA384)
+	by mail.mailpal.com (Stalwart SMTP) with ESMTPSA id 498FB22A5AF30C7;
+	Thu, 24 Sep 2026 12:08:35 +0000
+Authentication-Results: mail.mailpal.com; none
+Return-Path: <id-tzptt-rthrs-jfnnf-ppzbp@mailpal.com>
+DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=mailpal.com; c=relaxed/relaxed; r=y;
+	h=MIME-Version:Content-Transfer-Encoding:Content-Type:Message-ID:Date
+	:Subject:To:From:Reply-To:Cc:In-Reply-To:References:List-Id
+	:List-Unsubscribe:Organization:User-Agent:Thread-Topic:Thread-Index;
+	t=1790251715; x=1791115715; bh=78LCXgUHRREQqBxud8Q026cqbbu5Ykssu+4ARfiAp7Y=
+	; b=mDRdgRCWQ2idze7XM8PpHHyEOb3QIEsmboxm9sQptzjtdnUnwdoy7GAX6KqAkxw8uoJ3ziH
+	HUk9EfCKl+igukU22hEDxJtkuCi/TjucLs946qtTZUvR4x5L1ggu9P3vggN9ht58W7eZ9uFsfhl
+	00PcZL9dqMCBVsh+KMyy5FIhD1/nVJhyh3Hr938JP9VBa0SLmnepbCDVF4z3VsjRMD6w9xwbn6c
+	7awPA7kLlCmDwZ/dSSrtsnisn8yq7B+RiiwmOU7k8Fqxn3nxXM4VdqubW3R1/giywtiMUjbPhca
+	nSWqyFmADcf7uvXrOp45oL1ZaUsHozoweB1DkleJq8fXNw==;
+Authentication-Results: mailpal.com; hw-attest=pass header.typ=SFT header.alg=ES256 header.tier=declared header.aid=urn:aid:global:id-tzptt-rthrs-jfnnf-ppzbp
+Authentication-Results: mailpal.com; hw-trust=pass header.mode=identified header.tier=declared header.issuer=https://1id.com/realms/agents header.aid=urn:aid:global:id-tzptt-rthrs-jfnnf-ppzbp
+From: Declared Example Agent <id-tzptt-rthrs-jfnnf-ppzbp@mailpal.com>
+To: id-tzptt-rthrs-jfnnf-ppzbp@mailpal.com
+Subject: Example 5: declared-tier software key (Combined Mode)
+Date: Thu, 24 Sep 2026 22:08:41 +1000
+Message-ID: <179025172195.34424.12725361465052675358@mailpal.com>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+MIME-Version: 1.0
+Hardware-Trust-Proof: eyJhbGciOiJFUzI1NiIsImtpZCI6IjFpZC1od2F0dGVzdC1lczI1Ni0x
+ IiwidHlwIjoiYWlycy1lbWFpbCtzZC1qd3QifQ.eyJpc3MiOiJodHRwczovLzFpZC5jb20vcmVhbG
+ 1zL2FnZW50cyIsImlhdCI6MTc5MDI1MTcyMywiZXhwIjoxNzkwMjUyMDIzLCJub25jZSI6InhUQjh
+ TcVFtTHhlZmFNWUwwazBoc0FZRElEVy1uVktxQzJwZlM3ZVllYk0iLCJfc2RfYWxnIjoic2hhLTI1
+ NiIsIl9zZCI6WyI4WjdSLXVyWmZVOWJxMDdETkhRUXdjQkgzTGpiRFJ5OWd2U2I4VTdORVZJIiwiU
+ 3pWX2k5QzBqbC1FcFJJVEg5M3M0eG5FcjU5UWZObExYWVNYYmJCUHJJMCJdLCJjbmYiOnsiandrIj
+ p7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoiZkZDVXVJWktENmlfSlJfY0JMd1BrcHpqOVl
+ xTFFEZzY3UlpIemMzUUdWQSIsInkiOiJtbENDQV9FbFhERGIyT1I4YjFZeHRIZXhDVkV5c1haN1dX
+ TVJzRTR5SkVvIn19fQ.g-I5PjKHCY8JRcXC4l1lRP7vuRVeZZlorvGL7etybd-N_YNiou1WSB7Byt
+ kS2maBId3jIQgn-BQdn0JtFgt5hw~WyJ4Uk5YR1dFd2duXzViXzhUU19JX2pRIiwiYWlkIix7InRy
+ dXN0X3RpZXIiOiJkZWNsYXJlZCJ9XQ~WyJuU3VnOEh2SlRvRXRNaUlRb296RG53Iiwic3ViIiwidX
+ JuOmFpZDpnbG9iYWw6aWQtdHpwdHQtcnRocnMtamZubmYtcHB6YnAiXQ~
+X-1ID-Contact-Token: f45a2632
+Hardware-Attestation: v=1;
+ typ=SFT;
+ alg=ES256;
+ h=from:to:subject:date:message-id:reply-to:mime-version:content-type:
+ content-transfer-encoding:hardware-trust-proof:from:to:subject:date:
+ message-id:reply-to:mime-version:content-type:content-transfer-encoding:
+ hardware-trust-proof;
+ bh=78LCXgUHRREQqBxud8Q026cqbbu5Ykssu-4ARfiAp7Y;
+ ts=1790251724;
+ chain=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
+ d2721HS/zMy+Q==;
+ aid=urn:aid:global:id-tzptt-rthrs-jfnnf-ppzbp;
+ bind=eyJhbGciOiJFUzI1NiIsImtpZCI6IjFpZC1od2F0dGVzdC1lczI1Ni0xIiwidHlwIjoiYWly
+ cy1lbWFpbC1iaW5kaW5nK2p3dCJ9.eyJpc3MiOiJodHRwczovLzFpZC5jb20vcmVhbG1zL2FnZW50
+ cyIsInN1YiI6InVybjphaWQ6Z2xvYmFsOmlkLXR6cHR0LXJ0aHJzLWpmbm5mLXBwemJwIiwiaWF0I
+ joxNzkwMjUxNzEyLCJleHAiOjE3OTAyNTIwMTIsImNuZiI6eyJqd2siOnsia3R5IjoiRUMiLCJjcn
+ YiOiJQLTI1NiIsIngiOiJmRkNVdUlaS0Q2aV9KUl9jQkx3UGtwemo5WXFMUURnNjdSWkh6YzNRR1Z
+ BIiwieSI6Im1sQ0NBX0VsWEREYjJPUjhiMVl4dEhleENWRXlzWFo3V1dNUnNFNHlKRW8ifX0sImFp
+ ZCI6eyJ0cnVzdF90aWVyIjoiZGVjbGFyZWQifX0.KguKyb0rXQxZfRAwKCDVObnf2SeSd44vaWe8M
+ zqXsppSwI3737FDsn7ADtL5fAreYZKOR9xqY5FeHVK1yTZuMQ
+
+This message carries both Hardware-Attestation (Mode 1) and
+Hardware-Trust-Proof (Mode 2) headers in Combined mode.

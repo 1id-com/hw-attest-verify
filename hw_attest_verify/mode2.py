@@ -3,15 +3,18 @@ Mode 2 verification: Hardware-Trust-Proof header (SD-JWT with selective disclosu
 
 RFC: draft-drake-email-hardware-attestation-03, Section 6
 
-Verification steps (RFC Section 6.5):
-  1. Parse the SD-JWT presentation (header.payload.signature~disclosure1~...)
-  2. Extract the issuer (iss) claim
-  3. Obtain the Issuer's public key (DNS _hwattest.{domain} then JWKS fallback)
-  4. Verify the ES256 signature
-  5. Verify exp / iat timing
-  6. Verify each disclosure hash matches an _sd entry
-  7. Verify the message-binding nonce
-  8. Extract disclosed claims
+Verification follows the draft's "Verification Algorithm" for Mode 2:
+  1. Reject duplicate singleton fields; parse the SD-JWT (all input untrusted).
+  2. Disclosed canonical sub -> resolve it at the AIRS Registry and require
+     iss == currentIssuer (identified); no sub -> receiver-local policy must
+     trust iss (hidden) before any discovery.
+  3. RFC 8414 key discovery for that issuer; verify the JWS (ES256, RS256,
+     PS256) and the disclosures per RFC 9901; require aid.trust_tier; reject
+     a cnf-bearing presentation without a Hardware-Attestation field.
+  4. Require iat and nonce; reject a materially future iat; enforce exp.
+  5. Recompute the message-binding nonce and require equality.
+  6. Receiver-local age policy on iat (a policy result, not a failure).
+  7. Report identified (with the verified sub) or hidden.
 """
 
 from __future__ import annotations
@@ -22,13 +25,16 @@ import json
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
-from urllib.parse import urlparse
+from typing import Callable, Dict, Iterable, List, Optional
 
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, serialization
 
-from .issuer_key_discovery import discover_issuer_public_key
+from .issuer_key_discovery import (
+  TransientExternalLookupFailure,
+  discover_registrar_signing_key,
+  verify_compact_jws_signature,
+)
 
 
 from .parse import ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER, find_duplicate_singleton_header_field_names
@@ -66,6 +72,19 @@ class Mode2VerificationResult:
   failure_reasons: List[str] = field(default_factory=list)
   is_identified_mode: bool = False
   rdap_issuer_verified: bool = False
+  # Email draft IANA result name: pass / fail / policy / temperror / permerror.
+  authentication_results_result: str = "fail"
+  # Combined mode: the Issuer-signed payload carries cnf, and the RFC 7638
+  # thumbprint of its jwk ("" when absent or malformed).
+  carries_cnf_claim: bool = False
+  cnf_jwk_thumbprint: str = ""
+
+
+_ACCEPTED_ISSUER_JWS_ALGORITHMS = ("ES256", "RS256", "PS256")
+
+# Claims the verifier needs before or during verification: they MUST NOT be
+# selectively disclosable (draft "Header Field and Claims"; cnf in Combined mode).
+_CLAIMS_THAT_MUST_BE_IN_THE_ISSUER_SIGNED_PAYLOAD = ("iss", "iat", "exp", "nonce", "cnf")
 
 
 def verify_hardware_trust_proof(
@@ -76,211 +95,227 @@ def verify_hardware_trust_proof(
   max_timestamp_skew_seconds: int = _DEFAULT_MAX_TIMESTAMP_SKEW_SECONDS,
   max_token_lifetime_seconds: int = _DEFAULT_MAX_TOKEN_LIFETIME_SECONDS,
   reference_time_unix: Optional[int] = None,
-  issuer_public_key_override: Optional[ec.EllipticCurvePublicKey] = None,
+  issuer_public_key_override=None,
   skip_time_checks: bool = False,
+  current_issuer_resolver: Optional[Callable[[str], Optional[str]]] = None,
+  trusted_hidden_mode_issuers: Optional[Iterable[str]] = None,
+  max_proof_age_seconds: Optional[int] = None,
 ) -> Mode2VerificationResult:
-  """Verify a Mode 2 Hardware-Trust-Proof header.
-
-  Implements the full RFC Section 6.5 verification algorithm:
-    1. Parse SD-JWT presentation
-    2. Extract issuer, discover public key (DNS then JWKS)
-    3. Verify ES256 signature
-    4. Verify timing (exp, iat)
-    5. Verify disclosure hashes
-    6. Verify message-binding nonce
-    7. Extract disclosed claims
+  """Verify a Mode 2 Hardware-Trust-Proof header (see the module docstring).
 
   Args:
     header_value: The raw Hardware-Trust-Proof header value string.
-    email_headers: Dict of email header name -> value.
+    email_headers: Dict of lowercased email header name -> value.
     body: Raw email body bytes.
-    max_timestamp_skew_seconds: Maximum iat drift from reference time.
-    max_token_lifetime_seconds: Maximum allowed exp - iat span.
-    reference_time_unix: Unix timestamp for time checks (default: now).
-    issuer_public_key_override: If provided, skip key discovery and use this key.
+    ordered_header_pairs: Every header instance in order (duplicates, DKIM h= selection).
+    max_timestamp_skew_seconds: How far iat may be in the future before it fails.
+    max_token_lifetime_seconds: Local policy on exp - iat.
+    reference_time_unix: Unix time for the time checks (default: now).
+    issuer_public_key_override: Use this issuer key instead of RFC 8414 discovery
+      (tests / offline); the identified and hidden-mode issuer checks still apply.
+    skip_time_checks: Skip iat/exp/age checks (archived mail).
+    current_issuer_resolver: aid -> currentIssuer (None = no current issuer; raise
+      TransientExternalLookupFailure when it cannot complete). Default: AIRS RDAP.
+    trusted_hidden_mode_issuers: Issuers local policy trusts for hidden-identity
+      presentations (no sub). Empty: hidden mode yields policy.
+    max_proof_age_seconds: Local age policy on iat (default: max_timestamp_skew_seconds).
 
   Returns:
-    Mode2VerificationResult with is_valid=True if all checks pass.
+    Mode2VerificationResult; is_valid is True only for authentication_results_result "pass".
   """
   result = Mode2VerificationResult()
-  failure_reasons: List[str] = []
 
   if reference_time_unix is None:
     reference_time_unix = int(time.time())
+  if max_proof_age_seconds is None:
+    max_proof_age_seconds = max_timestamp_skew_seconds
+  if current_issuer_resolver is None:
+    current_issuer_resolver = _resolve_issuer_via_rdap
 
   duplicate_singleton_names = find_duplicate_singleton_header_field_names(ordered_header_pairs)
   if duplicate_singleton_names:
-    result.failure_reason = (
+    return _finish_mode2_result(result, "permerror", [
       f"Duplicate singleton headers (permerror): {', '.join(duplicate_singleton_names)}"
-    )
-    result.failure_reasons = [result.failure_reason]
-    return result
+    ])
 
   header_value = _unfold_mime_header_value(header_value)
-
   sd_jwt_parts = _parse_sd_jwt_presentation(header_value.strip())
   if sd_jwt_parts is None:
-    result.failure_reason = "Could not parse SD-JWT presentation"
-    result.failure_reasons = [result.failure_reason]
-    return result
-
+    return _finish_mode2_result(result, "permerror", ["Could not parse SD-JWT presentation"])
   jwt_header_json, jwt_payload_json, jwt_signature_bytes, disclosure_strings = sd_jwt_parts
 
   try:
     jwt_header = json.loads(jwt_header_json)
-  except json.JSONDecodeError as parse_error:
-    result.failure_reason = f"JWT header is not valid JSON: {parse_error}"
-    result.failure_reasons = [result.failure_reason]
-    return result
-
-  try:
     jwt_payload = json.loads(jwt_payload_json)
   except json.JSONDecodeError as parse_error:
-    result.failure_reason = f"JWT payload is not valid JSON: {parse_error}"
-    result.failure_reasons = [result.failure_reason]
-    return result
+    return _finish_mode2_result(result, "permerror", [f"JWT header or payload is not valid JSON: {parse_error}"])
+  if not isinstance(jwt_header, dict) or not isinstance(jwt_payload, dict):
+    return _finish_mode2_result(result, "permerror", ["JWT header and payload must be JSON objects"])
 
-  issuer = jwt_payload.get("iss", "")
-  if not issuer:
-    failure_reasons.append("Missing iss (issuer) claim in SD-JWT payload")
+  malformed_reasons: List[str] = []
+  jwt_typ = jwt_header.get("typ", "")
+  if jwt_typ != "airs-email+sd-jwt":
+    malformed_reasons.append(f"typ header must be 'airs-email+sd-jwt' (got {jwt_typ!r})")
+  algorithm = jwt_header.get("alg", "")
+  if algorithm not in _ACCEPTED_ISSUER_JWS_ALGORITHMS:
+    # AUD-F18: asymmetric algorithms only (RFC 8725); none / HS* never.
+    malformed_reasons.append(
+      f"Unsupported algorithm: {algorithm!r} (accepted: {', '.join(_ACCEPTED_ISSUER_JWS_ALGORITHMS)})"
+    )
+  kid = jwt_header.get("kid")
+  if not isinstance(kid, str) or not kid:
+    malformed_reasons.append("Missing kid header (required)")  # AUD-F51
+  issuer = jwt_payload.get("iss")
+  if not isinstance(issuer, str) or not issuer:
+    malformed_reasons.append("Missing iss (issuer) claim in the Issuer-signed payload")
+  sd_alg = jwt_payload.get("_sd_alg", "sha-256")
+  if sd_alg != "sha-256":
+    malformed_reasons.append(f"Unsupported _sd_alg: {sd_alg!r} (expected 'sha-256')")
+  iat = jwt_payload.get("iat")
+  if not isinstance(iat, int) or isinstance(iat, bool):
+    malformed_reasons.append("Missing or non-integer iat claim (required)")
+  exp = jwt_payload.get("exp")
+  if exp is not None and (not isinstance(exp, int) or isinstance(exp, bool)):
+    malformed_reasons.append("exp claim is not an integer")
+  nonce = jwt_payload.get("nonce")
+  if not isinstance(nonce, str) or not nonce:
+    malformed_reasons.append("Missing nonce claim (required for message binding)")
+  if malformed_reasons:
+    result.issuer = issuer if isinstance(issuer, str) else ""
+    return _finish_mode2_result(result, "permerror", malformed_reasons)
 
   result.issuer = issuer
+  result.issued_at_unix = iat
+  result.expires_at_unix = exp or 0
 
-  jwt_typ = jwt_header.get("typ", "")
-  if not jwt_typ:
-    failure_reasons.append("Missing typ header (required: 'airs-email+sd-jwt')")
-  elif jwt_typ != "airs-email+sd-jwt":
-    failure_reasons.append(f"Unexpected typ header: {jwt_typ!r} (expected 'airs-email+sd-jwt')")
+  # RFC 9901 disclosure processing needs only the digests, so the candidate
+  # sub is known before discovery; it stays untrusted until the signature and
+  # the digests have both verified (AUD-F52).
+  processed_payload, disclosure_errors = process_sd_jwt_disclosures_per_rfc9901(jwt_payload, disclosure_strings)
+  if disclosure_errors:
+    return _finish_mode2_result(result, "fail", disclosure_errors)
+  candidate_sub = processed_payload.get("sub")
+  if candidate_sub is not None and (not isinstance(candidate_sub, str) or not candidate_sub):
+    return _finish_mode2_result(result, "fail", ["sub is not a canonical AIRS identifier string"])
 
-  sd_alg = jwt_payload.get("_sd_alg", "")
-  if sd_alg and sd_alg != "sha-256":
-    failure_reasons.append(f"Unsupported _sd_alg: {sd_alg!r} (expected 'sha-256')")
+  # Step 2 (AUD-F03 / AUD-F16).
+  if candidate_sub:
+    try:
+      current_issuer = current_issuer_resolver(candidate_sub)
+    except TransientExternalLookupFailure as transient_lookup_failure:
+      return _finish_mode2_result(result, "temperror", [
+        f"AIRS resolution of {candidate_sub!r} could not complete: {transient_lookup_failure}"
+      ])
+    if not current_issuer:
+      return _finish_mode2_result(result, "fail", [
+        f"AIRS identity {candidate_sub!r} has no current issuer (identified verification fails)"
+      ])
+    if current_issuer != issuer:
+      return _finish_mode2_result(result, "fail", [
+        f"RDAP currentIssuer {current_issuer!r} does not match JWT iss {issuer!r}"
+      ])
+    result.rdap_issuer_verified = True
+  elif issuer not in set(trusted_hidden_mode_issuers or ()):
+    return _finish_mode2_result(result, "policy", [
+      f"Hidden-identity presentation from issuer {issuer!r}, which local policy does not trust"
+    ])
 
-  algorithm = jwt_header.get("alg", "")
-  if algorithm != "ES256":
-    failure_reasons.append(f"Unsupported algorithm: {algorithm} (expected ES256)")
-
-  iat = jwt_payload.get("iat")
-  exp = jwt_payload.get("exp")
-
-  if iat is None:
-    failure_reasons.append("Missing iat claim (required per RFC Section 5.2)")
-  else:
-    result.issued_at_unix = int(iat)
-    if not skip_time_checks:
-      iat_drift = abs(reference_time_unix - int(iat))
-      if iat_drift > max_timestamp_skew_seconds:
-        failure_reasons.append(
-          f"iat is {iat_drift}s from reference time (max: {max_timestamp_skew_seconds}s)"
-        )
-
-  if exp is not None:
-    result.expires_at_unix = int(exp)
-    if not skip_time_checks and int(exp) < reference_time_unix:
-      failure_reasons.append(f"Token has expired (exp={exp}, now={reference_time_unix})")
-
-  if iat is not None and exp is not None:
-    token_lifetime = int(exp) - int(iat)
-    if not skip_time_checks and token_lifetime > max_token_lifetime_seconds:
-      failure_reasons.append(
-        f"Token lifetime {token_lifetime}s exceeds maximum {max_token_lifetime_seconds}s"
-      )
-
-  if failure_reasons:
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
-
-  jwt_compact = header_value.strip().split("~")[0]
-  jwt_parts = jwt_compact.split(".")
-  if len(jwt_parts) != 3:
-    result.failure_reason = "SD-JWT does not have 3 dot-separated parts"
-    result.failure_reasons = [result.failure_reason]
-    return result
-
-  signing_input = f"{jwt_parts[0]}.{jwt_parts[1]}".encode("ascii")
-
+  # Step 3: authoritative key discovery and signature.
   public_key = issuer_public_key_override
   if public_key is None:
-    issuer_domain = _extract_domain_from_issuer(issuer)
-    if not issuer_domain:
-      result.failure_reason = f"Cannot extract domain from issuer: {issuer}"
-      result.failure_reasons = [result.failure_reason]
-      return result
-
-    kid = jwt_header.get("kid")
-    public_key = discover_issuer_public_key(issuer_domain, kid=kid)
+    try:
+      public_key, discovery_failure = discover_registrar_signing_key(issuer, kid)
+    except TransientExternalLookupFailure as transient_lookup_failure:
+      return _finish_mode2_result(result, "temperror", [
+        f"Issuer key discovery could not complete: {transient_lookup_failure}"
+      ])
     if public_key is None:
-      result.failure_reason = f"Could not discover issuer public key for {issuer_domain}"
-      result.failure_reasons = [result.failure_reason]
-      return result
+      return _finish_mode2_result(result, "fail", [f"Issuer key discovery failed: {discovery_failure}"])
+  jwt_compact_parts = header_value.strip().split("~")[0].split(".")
+  signing_input = f"{jwt_compact_parts[0]}.{jwt_compact_parts[1]}".encode("ascii")
+  signature_failure = verify_compact_jws_signature(public_key, algorithm, signing_input, jwt_signature_bytes)
+  if signature_failure:
+    return _finish_mode2_result(result, "fail", [f"Signature verification failed: {signature_failure}"])
 
-  signature_error = _verify_es256_signature(public_key, signing_input, jwt_signature_bytes)
-  if signature_error:
-    failure_reasons.append(f"Signature verification failed: {signature_error}")
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+  failure_reasons: List[str] = []
+  policy_reasons: List[str] = []
 
-  sd_array = jwt_payload.get("_sd", [])
-  disclosed_claims, disclosure_errors = _verify_and_extract_disclosures(
-    disclosure_strings, sd_array,
-  )
-  for disclosure_error_message in disclosure_errors:
-    failure_reasons.append(disclosure_error_message)
-
-  nonce = jwt_payload.get("nonce")
-  if nonce is None:
-    failure_reasons.append("Missing nonce claim (required for message binding)")
-  elif iat is None:
-    failure_reasons.append("Cannot verify nonce: iat is absent (both are required)")
+  aid_claim = processed_payload.get("aid")
+  disclosed_trust_tier = aid_claim.get("trust_tier") if isinstance(aid_claim, dict) else None
+  if isinstance(disclosed_trust_tier, str) and disclosed_trust_tier:
+    result.trust_tier = disclosed_trust_tier
   else:
-    expected_nonce = _compute_message_binding_nonce(
-      email_headers, body, int(iat),
-      ordered_header_pairs=ordered_header_pairs,
-    )
-    if nonce != expected_nonce:
+    failure_reasons.append("aid.trust_tier is not disclosed (every presentation MUST disclose it)")  # AUD-F17
+
+  if "cnf" in jwt_payload:
+    result.carries_cnf_claim = True
+    cnf_claim = jwt_payload.get("cnf")
+    cnf_jwk = cnf_claim.get("jwk") if isinstance(cnf_claim, dict) else None
+    from .mode1 import _compute_jwk_thumbprint_from_jwk_dict
+    result.cnf_jwk_thumbprint = (
+      _compute_jwk_thumbprint_from_jwk_dict(cnf_jwk) if isinstance(cnf_jwk, dict) else None
+    ) or ""
+    if not result.cnf_jwk_thumbprint:
+      failure_reasons.append("cnf claim has no usable jwk")
+    if not _message_has_hardware_attestation_field(email_headers, ordered_header_pairs):
       failure_reasons.append(
-        f"Message-binding nonce mismatch: got {nonce!r}, expected {expected_nonce!r}"
+        "SD-JWT carries cnf (Combined mode) but the message has no Hardware-Attestation field"
       )
 
-  result.disclosed_claims = disclosed_claims
-
-  aid_claim = disclosed_claims.get("aid")
-  if isinstance(aid_claim, dict):
-    result.trust_tier = str(aid_claim.get("trust_tier", ""))
-  else:
-    result.trust_tier = str(disclosed_claims.get("trust_tier", jwt_payload.get("trust_tier", "")))
-
-  sub_from_disclosures = disclosed_claims.get("sub", "")
-  sub_from_payload = jwt_payload.get("sub", "")
-  resolved_sub = str(sub_from_disclosures or sub_from_payload)
-  result.agent_identity_urn = resolved_sub
-  result.is_identified_mode = bool(resolved_sub)
-
-  if result.is_identified_mode and not failure_reasons:
-    rdap_issuer = _resolve_issuer_via_rdap(result.agent_identity_urn)
-    if rdap_issuer is not None:
-      if rdap_issuer == issuer:
-        result.rdap_issuer_verified = True
-      else:
-        failure_reasons.append(
-          f"RDAP currentIssuer {rdap_issuer!r} does not match JWT iss {issuer!r}"
-        )
-    else:
-      import logging
-      logging.getLogger("hw_attest_verify.mode2").info(
-        "RDAP lookup for %s returned no result (issuer not verified via RDAP)",
-        result.agent_identity_urn,
+  if not skip_time_checks:
+    if iat > reference_time_unix + max_timestamp_skew_seconds:
+      failure_reasons.append(f"iat {iat} is materially in the future (reference time {reference_time_unix})")
+    if exp is not None and exp < reference_time_unix:
+      failure_reasons.append(f"Token has expired (exp={exp}, now={reference_time_unix})")
+    # AUD-F49: age and lifetime limits are receiver policy, not forgery.
+    if reference_time_unix - iat > max_proof_age_seconds:
+      policy_reasons.append(
+        f"iat is {reference_time_unix - iat}s old (local age policy allows {max_proof_age_seconds}s)"
       )
+    if exp is not None and exp - iat > max_token_lifetime_seconds:
+      policy_reasons.append(
+        f"Token lifetime {exp - iat}s exceeds the local maximum {max_token_lifetime_seconds}s"
+      )
+
+  expected_nonce = _compute_message_binding_nonce(
+    email_headers, body, iat, ordered_header_pairs=ordered_header_pairs,
+  )
+  if nonce != expected_nonce:
+    failure_reasons.append(f"Message-binding nonce mismatch: got {nonce!r}, expected {expected_nonce!r}")
+
+  result.disclosed_claims = {
+    claim_name: claim_value for claim_name, claim_value in processed_payload.items()
+    if claim_name not in _CLAIMS_THAT_MUST_BE_IN_THE_ISSUER_SIGNED_PAYLOAD
+  }
+  result.agent_identity_urn = candidate_sub or ""
+  result.is_identified_mode = bool(candidate_sub)
 
   if failure_reasons:
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode2_result(result, "fail", failure_reasons)
+  if policy_reasons:
+    return _finish_mode2_result(result, "policy", policy_reasons)
+  return _finish_mode2_result(result, "pass", [])
 
-  result.is_valid = True
+
+def _finish_mode2_result(
+  result: Mode2VerificationResult,
+  authentication_results_result: str,
+  reasons: List[str],
+) -> Mode2VerificationResult:
+  result.authentication_results_result = authentication_results_result
+  result.is_valid = authentication_results_result == "pass"
+  result.failure_reasons = list(reasons)
+  result.failure_reason = reasons[0] if reasons else ""
   return result
+
+
+def _message_has_hardware_attestation_field(
+  email_headers: Dict[str, str],
+  ordered_header_pairs: Optional[List[tuple]],
+) -> bool:
+  if ordered_header_pairs:
+    return any(str(name).strip().lower() == "hardware-attestation" for name, _value in ordered_header_pairs)
+  return any(str(name).strip().lower() == "hardware-attestation" for name in email_headers)
 
 
 def _parse_sd_jwt_presentation(
@@ -324,45 +359,6 @@ def _base64url_encode_no_padding(data: bytes) -> str:
   return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def _extract_domain_from_issuer(issuer: str) -> Optional[str]:
-  """Extract the domain name from an issuer URL or identifier."""
-  if issuer.startswith("https://") or issuer.startswith("http://"):
-    parsed = urlparse(issuer)
-    return parsed.hostname
-  if "." in issuer and "/" not in issuer:
-    return issuer
-  return None
-
-
-def _verify_es256_signature(
-  public_key: ec.EllipticCurvePublicKey,
-  signing_input: bytes,
-  signature_bytes: bytes,
-) -> Optional[str]:
-  """Verify an ES256 (ECDSA P-256 + SHA-256) JWS signature.
-
-  JWS signatures use raw R||S format (64 bytes for P-256),
-  not DER-encoded. Convert to DER before calling cryptography.
-
-  Returns None on success, or an error string on failure.
-  """
-  from cryptography.exceptions import InvalidSignature
-
-  if len(signature_bytes) != 64:
-    return (
-      f"ES256 JWS signature must be exactly 64 bytes (raw R||S), "
-      f"got {len(signature_bytes)} bytes"
-    )
-  try:
-    der_signature = _raw_rs_to_der(signature_bytes)
-    public_key.verify(der_signature, signing_input, ec.ECDSA(hashes.SHA256()))
-    return None
-  except InvalidSignature:
-    return "ES256 signature does not match"
-  except Exception as unexpected_error:
-    return f"Unexpected error: {unexpected_error}"
-
-
 def _raw_rs_to_der(raw_rs: bytes) -> bytes:
   """Convert a raw R||S ECDSA signature (JWS format) to DER format."""
   r_bytes = raw_rs[:32]
@@ -380,41 +376,102 @@ def _raw_rs_to_der(raw_rs: bytes) -> bytes:
   return b"\x30" + bytes([len(sequence_content)]) + sequence_content
 
 
-def _verify_and_extract_disclosures(
+def process_sd_jwt_disclosures_per_rfc9901(
+  issuer_signed_payload: dict,
   disclosure_strings: List[str],
-  sd_array: List[str],
 ) -> tuple:
-  """Verify disclosure hashes against the _sd array and extract claims.
+  """RFC 9901 Section 7.1 step 3: replace the digests embedded in the payload
+  (object _sd arrays and {"...": digest} array elements, recursively, including
+  inside disclosed values) with the disclosed claims.
 
-  Each disclosure is base64url-encoded JSON: [salt, claim_name, claim_value].
-  Its hash is base64url(SHA-256(disclosure_string)).
+  Rejects: undecodable or malformed disclosures, a digest that appears more
+  than once, a disclosure of the wrong kind for its position, a disclosed claim
+  name that is _sd / ... or already present, a top-level disclosure of a claim
+  that must be in the Issuer-signed payload, and a disclosure not referenced
+  by any digest. Digests with no disclosure (decoys, withheld claims) are dropped.
 
-  Returns (disclosed_claims_dict, [error_messages]).
+  Returns (processed_payload, []) or (None, [error]).
   """
-  disclosed_claims: Dict[str, object] = {}
-  error_messages: List[str] = []
-
+  disclosures_by_digest: Dict[str, list] = {}
   for disclosure_b64 in disclosure_strings:
-    disclosure_hash = _base64url_encode_no_padding(
-      hashlib.sha256(disclosure_b64.encode("ascii")).digest()
-    )
-    if disclosure_hash not in sd_array:
-      error_messages.append(
-        f"Disclosure hash {disclosure_hash} not found in _sd array"
-      )
-      continue
-
+    digest = _base64url_encode_no_padding(hashlib.sha256(disclosure_b64.encode("ascii")).digest())
     try:
-      disclosure_json = _base64url_decode_to_string(disclosure_b64)
-      disclosure_array = json.loads(disclosure_json)
-      if isinstance(disclosure_array, list) and len(disclosure_array) >= 3:
-        claim_name = str(disclosure_array[1])
-        claim_value = disclosure_array[2]
-        disclosed_claims[claim_name] = claim_value
+      decoded_disclosure = json.loads(_base64url_decode_to_string(disclosure_b64))
     except Exception as decode_error:
-      error_messages.append(f"Could not decode disclosure: {decode_error}")
+      return None, [f"Could not decode disclosure: {decode_error}"]
+    if (
+      not isinstance(decoded_disclosure, list)
+      or len(decoded_disclosure) not in (2, 3)
+      or not isinstance(decoded_disclosure[0], str)
+      or (len(decoded_disclosure) == 3 and not isinstance(decoded_disclosure[1], str))
+    ):
+      return None, ["Disclosure is not [salt, claim_name, value] or [salt, value]"]
+    if digest in disclosures_by_digest:
+      return None, ["The same disclosure is presented more than once"]
+    disclosures_by_digest[digest] = decoded_disclosure
 
-  return disclosed_claims, error_messages
+  referenced_digests: set = set()
+  embedded_digests_seen: set = set()
+
+  def claim_digest_once(digest) -> Optional[list]:
+    if not isinstance(digest, str):
+      raise ValueError("an embedded digest is not a string")
+    if digest in embedded_digests_seen:
+      raise ValueError(f"digest {digest} appears more than once")
+    embedded_digests_seen.add(digest)
+    disclosure = disclosures_by_digest.get(digest)
+    if disclosure is not None:
+      referenced_digests.add(digest)
+    return disclosure
+
+  def process(value, is_top_level_object: bool = False):
+    if isinstance(value, dict):
+      processed_object = {
+        claim_name: process(claim_value)
+        for claim_name, claim_value in value.items() if claim_name != "_sd"
+      }
+      embedded_object_digests = value.get("_sd", [])
+      if not isinstance(embedded_object_digests, list):
+        raise ValueError("_sd is not an array")
+      for digest in embedded_object_digests:
+        disclosure = claim_digest_once(digest)
+        if disclosure is None:
+          continue
+        if len(disclosure) != 3:
+          raise ValueError("an _sd digest refers to an array-element disclosure")
+        _salt, claim_name, claim_value = disclosure
+        if claim_name in ("_sd", "..."):
+          raise ValueError(f"disclosed claim name {claim_name!r} is not allowed")
+        if claim_name in processed_object:
+          raise ValueError(f"disclosed claim {claim_name!r} is already present")
+        if is_top_level_object and claim_name in _CLAIMS_THAT_MUST_BE_IN_THE_ISSUER_SIGNED_PAYLOAD:
+          raise ValueError(f"{claim_name!r} MUST NOT be selectively disclosable")
+        processed_object[claim_name] = process(claim_value)
+      return processed_object
+    if isinstance(value, list):
+      processed_array = []
+      for element in value:
+        if isinstance(element, dict) and list(element.keys()) == ["..."]:
+          disclosure = claim_digest_once(element["..."])
+          if disclosure is None:
+            continue
+          if len(disclosure) != 2:
+            raise ValueError("an array-element digest refers to an object-property disclosure")
+          processed_array.append(process(disclosure[1]))
+        else:
+          processed_array.append(process(element))
+      return processed_array
+    return value
+
+  try:
+    processed_payload = process(issuer_signed_payload, is_top_level_object=True)
+  except (ValueError, RecursionError) as processing_error:
+    return None, [f"SD-JWT disclosure processing failed: {processing_error}"]
+  unreferenced_digests = set(disclosures_by_digest) - referenced_digests
+  if unreferenced_digests:
+    return None, [f"{len(unreferenced_digests)} disclosure(s) are not referenced by any digest"]
+  processed_payload.pop("_sd_alg", None)
+  return processed_payload, []
 
 
 def _canonicalise_header_value_using_dkim2_header_hash_rules(raw_value: str) -> str:
@@ -517,14 +574,13 @@ _AIRS_RDAP_BASE_URL = "https://airs.1id.biz"
 
 
 def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
-  """Resolve an agent identity URN via AIRS RDAP and return currentIssuer.
+  """Resolve a canonical aid at the AIRS Registry (RDAP) and return its
+  currentIssuer (draft-drake-agent-identity-resolution).
 
-  Per draft-drake-agent-identity-resolution-00 Section 4, the verifier
-  resolves the sub claim to confirm the issuer matches the RDAP-advertised
-  currentIssuer for that identity.
-
-  Returns the currentIssuer string, or None if RDAP lookup fails or the
-  identity is not found (non-fatal -- allows offline/degraded verification).
+  Returns None when the identity is unknown (HTTP 404) or has no current
+  issuer: Registrar-backed verification then fails. Raises
+  TransientExternalLookupFailure when the lookup cannot complete (network,
+  timeout, HTTP 429/5xx): the result is temperror, never a silent pass (AUD-F03).
   """
   import urllib.request
   import urllib.error
@@ -538,7 +594,16 @@ def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
     request = urllib.request.Request(rdap_url, headers={"Accept": "application/rdap+json"})
     with urllib.request.urlopen(request, timeout=_RDAP_TIMEOUT_SECONDS) as response:
       data = json.loads(response.read().decode("utf-8"))
-      aid_data = data.get("aid_data", {})
-      return aid_data.get("currentIssuer")
-  except (urllib.error.URLError, urllib.error.HTTPError, json.JSONDecodeError, OSError):
+  except urllib.error.HTTPError as http_error:
+    if http_error.code == 404:
+      return None
+    if http_error.code == 429 or http_error.code >= 500:
+      raise TransientExternalLookupFailure(f"RDAP {rdap_url}: HTTP {http_error.code}") from http_error
     return None
+  except (urllib.error.URLError, TimeoutError, OSError) as network_error:
+    raise TransientExternalLookupFailure(f"RDAP {rdap_url}: {network_error}") from network_error
+  except json.JSONDecodeError:
+    return None
+  aid_data = data.get("aid_data") if isinstance(data, dict) else None
+  current_issuer = aid_data.get("currentIssuer") if isinstance(aid_data, dict) else None
+  return current_issuer if isinstance(current_issuer, str) and current_issuer else None

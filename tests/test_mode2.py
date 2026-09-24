@@ -11,13 +11,24 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, serialization
 
 from hw_attest_verify.mode2 import (
-  verify_hardware_trust_proof,
+  verify_hardware_trust_proof as verify_hardware_trust_proof_component_under_test,
   _parse_sd_jwt_presentation,
   _compute_message_binding_nonce,
   _raw_rs_to_der,
-  _verify_and_extract_disclosures,
+  process_sd_jwt_disclosures_per_rfc9901,
   _base64url_encode_no_padding,
 )
+
+TEST_ISSUER = "https://1id.com"
+
+
+def verify_hardware_trust_proof(**keyword_arguments):
+  """The component, with the two external trust inputs the draft requires made
+  explicit for offline tests: the AIRS Registry says TEST_ISSUER is every test
+  identity's currentIssuer, and local policy trusts TEST_ISSUER for hidden mode."""
+  keyword_arguments.setdefault("current_issuer_resolver", lambda aid: TEST_ISSUER)
+  keyword_arguments.setdefault("trusted_hidden_mode_issuers", [TEST_ISSUER])
+  return verify_hardware_trust_proof_component_under_test(**keyword_arguments)
 
 
 def _b64url_encode(data: bytes) -> str:
@@ -103,7 +114,7 @@ def _make_test_sd_jwt(private_key, email_headers, body, extra_claims=None):
   if extra_claims:
     payload.update(extra_claims)
 
-  header = {"alg": "ES256", "typ": "airs-email+sd-jwt"}
+  header = {"alg": "ES256", "kid": "test-kid", "typ": "airs-email+sd-jwt"}
 
   jwt_compact = _sign_jwt_es256(
     private_key,
@@ -170,15 +181,15 @@ class TestDisclosureVerification:
     disclosure_hash = _b64url_encode(
       hashlib.sha256(disclosure.encode("ascii")).digest()
     )
-    claims, errors = _verify_and_extract_disclosures([disclosure], [disclosure_hash])
+    processed, errors = process_sd_jwt_disclosures_per_rfc9901({"iss": TEST_ISSUER, "_sd": [disclosure_hash]}, [disclosure])
     assert errors == []
-    assert claims["aid"] == {"trust_tier": "sovereign"}
+    assert processed["aid"] == {"trust_tier": "sovereign"}
 
-  def test_disclosure_with_wrong_hash_reports_error(self):
+  def test_disclosure_not_referenced_by_any_digest_is_rejected(self):
     disclosure = _make_disclosure("salt", "aid", {"trust_tier": "sovereign"})
-    claims, errors = _verify_and_extract_disclosures([disclosure], ["wrong_hash"])
-    assert len(errors) == 1
-    assert "not found in _sd array" in errors[0]
+    processed, errors = process_sd_jwt_disclosures_per_rfc9901({"iss": TEST_ISSUER, "_sd": ["wrong_hash"]}, [disclosure])
+    assert processed is None
+    assert "not referenced" in errors[0]
 
 
 class TestRawRsToDer:
@@ -207,7 +218,7 @@ class TestEndToEndMode2Verification:
     )
     assert result.is_valid, f"Expected valid but got: {result.failure_reasons}"
     assert result.trust_tier == "sovereign"
-    assert result.issuer == "https://1id.com"
+    assert result.issuer == TEST_ISSUER
 
   def test_wrong_key_fails_verification(self):
     private_key, _ = _generate_test_ec_keypair()
@@ -263,7 +274,7 @@ class TestEndToEndMode2Verification:
       "nonce": nonce,
       "_sd": [aid_disclosure_hash],
     })
-    header = json.dumps({"alg": "ES256", "typ": "airs-email+sd-jwt"})
+    header = json.dumps({"alg": "ES256", "kid": "test-kid", "typ": "airs-email+sd-jwt"})
     jwt = _sign_jwt_es256(private_key, header, payload)
     presentation = f"{jwt}~{aid_disclosure}~"
 
@@ -295,7 +306,7 @@ def _make_hidden_mode_sd_jwt(private_key, email_headers, body):
     "nonce": nonce,
     "_sd": [aid_hash],
   }
-  header = {"alg": "ES256", "typ": "airs-email+sd-jwt"}
+  header = {"alg": "ES256", "kid": "test-kid", "typ": "airs-email+sd-jwt"}
   jwt_compact = _sign_jwt_es256(private_key, json.dumps(header), json.dumps(payload))
   return f"{jwt_compact}~{aid_disclosure}~"
 
@@ -349,7 +360,7 @@ class TestMode2IdentifiedVsHidden:
       "iat": iat, "exp": iat + 300, "nonce": nonce,
       "_sd": [aid_hash],
     })
-    header = json.dumps({"alg": "ES256", "typ": "WRONG-TYP"})
+    header = json.dumps({"alg": "ES256", "kid": "test-kid", "typ": "WRONG-TYP"})
     jwt_compact = _sign_jwt_es256(private_key, header, payload)
     presentation = f"{jwt_compact}~{aid_disclosure}~"
     result = verify_hardware_trust_proof(

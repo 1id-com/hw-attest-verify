@@ -11,6 +11,12 @@ Options:
   --no-time-check      Skip timestamp/expiry checks (for archived emails)
   --allow-self-signed  Accept self-signed certificates (INSECURE -- testing only)
   --trust-store PATH   PEM file containing trusted root CAs for chain validation
+                       (the manufacturer-rooted Mode 1 path; Registrar-bound
+                       Mode 1 with aid/bind needs no trust store)
+  --trust-hidden-issuer URI
+                       Local policy: trust this issuer for hidden-identity
+                       Mode 2 (no sub). Repeatable. Without it hidden mode
+                       yields hw-trust=policy.
 
 Parses a raw email (RFC 5322 format), checks for Hardware-Attestation
 and/or Hardware-Trust-Proof headers, and prints verification results.
@@ -25,6 +31,7 @@ import sys
 from email.policy import compat32 as compat32_policy
 from typing import List, Optional
 
+from .combined import apply_combined_mode_requirements_to_mode2_result
 from .mode1 import verify_hardware_attestation, VerificationResult
 from .mode2 import verify_hardware_trust_proof, Mode2VerificationResult
 
@@ -90,14 +97,16 @@ def _format_mode1_auth_results_line(
   hostname: str,
   mode1_result: VerificationResult,
 ) -> str:
-  """Format a Mode 1 result as an Authentication-Results header line."""
-  status = "pass" if mode1_result.is_valid else "fail"
+  """Format a Mode 1 result as an Authentication-Results header line. tier and
+  aid appear only when Registrar binding verification succeeded."""
+  status = mode1_result.authentication_results_result
   line = (
     f"Authentication-Results: {hostname}; hw-attest={status}"
     f" header.typ={_sanitize_auth_results_token(mode1_result.typ)}"
     f" header.alg={_sanitize_auth_results_token(mode1_result.alg)}"
-    f" header.tier={_sanitize_auth_results_token(mode1_result.trust_tier)}"
   )
+  if mode1_result.trust_tier:
+    line += f" header.tier={_sanitize_auth_results_token(mode1_result.trust_tier)}"
   if mode1_result.agent_identity_urn:
     line += f" header.aid={_sanitize_auth_results_token(mode1_result.agent_identity_urn)}"
   if not mode1_result.is_valid and mode1_result.failure_reason:
@@ -115,7 +124,7 @@ def _format_mode2_auth_results_line(
     hw-trust=pass header.mode=identified header.tier=sovereign
       header.issuer=https://1id.com header.aid=urn:aid:global:id-...
   """
-  status = "pass" if mode2_result.is_valid else "fail"
+  status = mode2_result.authentication_results_result
   tier = _sanitize_auth_results_token(mode2_result.trust_tier or "unknown")
   mode_value = "identified" if mode2_result.is_identified_mode else "hidden"
 
@@ -153,43 +162,13 @@ def _load_trusted_root_certificates_from_pem_file(pem_file_path: str):
   return certificates
 
 
-def _verify_combined_mode_cross_checks(
-  mode1_result: VerificationResult,
-  mode2_result: Mode2VerificationResult,
-  headers: dict,
-  ordered_header_pairs,
-) -> List[str]:
-  """Cross-check consistency when both Mode 1 and Mode 2 are present.
-
-  If both passed independently, verify that:
-   - aid matches between Mode 1 and Mode 2 (if both disclose identity)
-   - trust_tier is consistent
-  """
-  combined_mode_cross_check_errors: List[str] = []
-
-  if mode1_result.agent_identity_urn and mode2_result.agent_identity_urn:
-    if mode1_result.agent_identity_urn != mode2_result.agent_identity_urn:
-      combined_mode_cross_check_errors.append(
-        f"Mode 1 aid={mode1_result.agent_identity_urn!r} differs from "
-        f"Mode 2 aid={mode2_result.agent_identity_urn!r}"
-      )
-
-  if mode1_result.trust_tier and mode2_result.trust_tier:
-    if mode1_result.trust_tier != mode2_result.trust_tier:
-      combined_mode_cross_check_errors.append(
-        f"Mode 1 trust_tier={mode1_result.trust_tier!r} differs from "
-        f"Mode 2 trust_tier={mode2_result.trust_tier!r}"
-      )
-
-  return combined_mode_cross_check_errors
-
-
 def verify_email_from_raw(
   raw_email: str,
   skip_time_checks: bool = False,
   allow_self_signed: bool = False,
   trust_store_pem_path: Optional[str] = None,
   allow_eddsa: bool = False,
+  trusted_hidden_mode_issuers: Optional[List[str]] = None,
 ) -> dict:
   """Parse a raw email and verify any attestation headers found.
 
@@ -234,6 +213,7 @@ def verify_email_from_raw(
     if duplicate_header_violations:
       mode1_result = VerificationResult()
       mode1_result.is_valid = False
+      mode1_result.authentication_results_result = "permerror"
       mode1_result.failure_reason = duplicate_error_message
       mode1_result.failure_reasons = [duplicate_error_message]
     else:
@@ -249,6 +229,9 @@ def verify_email_from_raw(
       )
     results["mode1_hardware_attestation"] = {
       "is_valid": mode1_result.is_valid,
+      "result": mode1_result.authentication_results_result,
+      "registrar_binding_verified": mode1_result.registrar_binding_verified,
+      "manufacturer_rooted_path_verified": mode1_result.manufacturer_rooted_path_verified,
       "trust_tier": mode1_result.trust_tier,
       "typ": mode1_result.typ,
       "alg": mode1_result.alg,
@@ -266,6 +249,7 @@ def verify_email_from_raw(
     if duplicate_header_violations:
       mode2_result = Mode2VerificationResult()
       mode2_result.is_valid = False
+      mode2_result.authentication_results_result = "permerror"
       mode2_result.failure_reason = duplicate_error_message
       mode2_result.failure_reasons = [duplicate_error_message]
     else:
@@ -275,9 +259,18 @@ def verify_email_from_raw(
         body=body,
         ordered_header_pairs=ordered_header_pairs,
         skip_time_checks=skip_time_checks,
+        trusted_hidden_mode_issuers=trusted_hidden_mode_issuers,
       )
+    if mode1_header_value:
+      combined_mode_errors = apply_combined_mode_requirements_to_mode2_result(
+        results["_mode1_result_object"], mode2_result,
+      )
+      if combined_mode_errors:
+        results["combined_mode_errors"] = combined_mode_errors
     results["mode2_hardware_trust_proof"] = {
       "is_valid": mode2_result.is_valid,
+      "result": mode2_result.authentication_results_result,
+      "mode": "identified" if mode2_result.is_identified_mode else "hidden",
       "trust_tier": mode2_result.trust_tier,
       "agent_identity_urn": mode2_result.agent_identity_urn,
       "issuer": mode2_result.issuer,
@@ -288,15 +281,6 @@ def verify_email_from_raw(
       "failure_reasons": mode2_result.failure_reasons,
     }
     results["_mode2_result_object"] = mode2_result
-
-  mode1_obj = results.get("_mode1_result_object")
-  mode2_obj = results.get("_mode2_result_object")
-  if mode1_obj and mode2_obj and mode1_obj.is_valid and mode2_obj.is_valid:
-    combined_mode_errors = _verify_combined_mode_cross_checks(
-      mode1_obj, mode2_obj, headers, ordered_header_pairs,
-    )
-    if combined_mode_errors:
-      results["combined_mode_errors"] = combined_mode_errors
 
   if not any(k.startswith("mode") for k in results):
     results["error"] = "No Hardware-Attestation or Hardware-Trust-Proof headers found"
@@ -311,6 +295,7 @@ def main() -> None:
   allow_self_signed = False
   allow_eddsa = False
   trust_store_pem_path: Optional[str] = None
+  trusted_hidden_mode_issuers: List[str] = []
   file_path: Optional[str] = None
 
   positional_args: List[str] = []
@@ -328,6 +313,9 @@ def main() -> None:
     elif arg == "--trust-store" and arg_index + 1 < len(sys.argv):
       arg_index += 1
       trust_store_pem_path = sys.argv[arg_index]
+    elif arg == "--trust-hidden-issuer" and arg_index + 1 < len(sys.argv):
+      arg_index += 1
+      trusted_hidden_mode_issuers.append(sys.argv[arg_index])
     elif arg == "--hostname" and arg_index + 1 < len(sys.argv):
       arg_index += 1
       auth_results_hostname = sys.argv[arg_index]
@@ -350,6 +338,7 @@ def main() -> None:
     allow_self_signed=allow_self_signed,
     trust_store_pem_path=trust_store_pem_path,
     allow_eddsa=allow_eddsa,
+    trusted_hidden_mode_issuers=trusted_hidden_mode_issuers,
   )
 
   if auth_results_output_mode:

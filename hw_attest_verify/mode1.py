@@ -22,7 +22,7 @@ import re
 import struct
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 from cryptography import x509
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
@@ -46,6 +46,7 @@ from .signer_certificate_path_building_and_validation import (
 
 
 from .parse import ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER, find_duplicate_singleton_header_field_names
+from .issuer_key_discovery import TransientExternalLookupFailure
 
 _MINIMUM_HEADERS_FOR_RFC_MESSAGE_BINDING = list(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER)
 
@@ -65,6 +66,15 @@ class VerificationResult:
   certificate_chain_length: int = 0
   failure_reason: str = ""
   failure_reasons: List[str] = field(default_factory=list)
+  # Email draft: record which trust path(s) succeeded.
+  registrar_binding_verified: bool = False
+  manufacturer_rooted_path_verified: Optional[bool] = None
+  # Email draft IANA result name: pass / fail / policy / temperror / permerror.
+  authentication_results_result: str = "fail"
+  # For the Combined-mode checks: h= field names and the RFC 7638 thumbprint
+  # of the CMS signer public key (set once the CMS signature verified).
+  signed_header_names: List[str] = field(default_factory=list)
+  signer_public_key_jwk_thumbprint: str = ""
 
 
 _ACCEPTED_CMS_ALGORITHMS = {"RS256", "ES256", "PS256"}
@@ -80,6 +90,7 @@ def verify_hardware_attestation(
   allow_self_signed: bool = False,
   reference_time_unix: Optional[int] = None,
   allow_eddsa: bool = False,
+  current_issuer_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> VerificationResult:
   """Verify a Mode 1 Hardware-Attestation header.
 
@@ -104,6 +115,7 @@ def verify_hardware_attestation(
   result.alg = parsed.alg
   result.timestamp_unix = parsed.ts
   result.agent_identity_urn = parsed.aid
+  result.signed_header_names = list(parsed.signed_header_names)
 
   # Reject grammar errors before interpreting values; legal FWS is handled by
   # the individual tag grammar and is never globally stripped into validity.
@@ -147,28 +159,38 @@ def verify_hardware_attestation(
       f"h= tag missing required headers: {', '.join(sorted(missing_required_headers))}"
     )
 
+  if parsed.aid and not parsed.bind:
+    failure_reasons.append(
+      "aid is present but bind is absent (sender MUST NOT place aid without Registrar binding)"
+    )
+  elif parsed.bind and not parsed.aid:
+    failure_reasons.append(
+      "bind is present but aid is absent (aid and bind must both appear or both be absent)"
+    )
+
+  # Draft step 1: duplicates, unsupported versions, malformed encodings and
+  # aid/bind without the other are permerror.
   if failure_reasons:
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode1_result(result, "permerror", failure_reasons)
 
   if reference_time_unix is None:
     reference_time_unix = int(time.time())
 
+  # AUD-F49 / draft step 3: a stale (or future) ts is a local freshness POLICY
+  # outcome, not a forged signature; it is reported only if nothing failed.
+  freshness_policy_reason = ""
   timestamp_age_seconds = abs(reference_time_unix - parsed.ts)
   if timestamp_age_seconds > max_timestamp_skew_seconds:
-    failure_reasons.append(
-      f"Timestamp too far from current time: {timestamp_age_seconds}s drift "
-      f"(max allowed: {max_timestamp_skew_seconds}s)"
+    freshness_policy_reason = (
+      f"ts is {timestamp_age_seconds}s from the reference time (local freshness "
+      f"policy allows {max_timestamp_skew_seconds}s)"
     )
 
   try:
     chain_der_bytes = base64.b64decode(parsed.chain_base64)
   except Exception as decode_error:
     failure_reasons.append(f"Could not base64-decode chain parameter: {decode_error}")
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode1_result(result, "permerror", failure_reasons)
 
   # AUD-F78: decode the chain= CMS strictly and fail closed on any deviation
   # from the Version 1 profile (the old byte-search helpers skipped unknown
@@ -182,9 +204,7 @@ def verify_hardware_attestation(
     )
   except (Mode1CmsProfileViolation, ValueError, UnsupportedAlgorithm) as cms_profile_error:
     failure_reasons.append(f"CMS SignedData does not match the Version 1 profile: {cms_profile_error}")
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode1_result(result, "permerror", failure_reasons)
 
   result.certificate_chain_length = len(signed_data_certificates)
 
@@ -196,9 +216,7 @@ def verify_hardware_attestation(
     )
   except ValueError as chain_self_reference_error:
     failure_reasons.append(str(chain_self_reference_error))
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode1_result(result, "permerror", failure_reasons)
 
   attestation_input_72_bytes = _compute_attestation_input(
     email_headers=email_headers,
@@ -220,6 +238,7 @@ def verify_hardware_attestation(
   )
   if verification_error is None:
     leaf_certificate = signer_certificate
+    result.signer_public_key_jwk_thumbprint = _compute_jwk_thumbprint_from_certificate(signer_certificate) or ""
   else:
     failure_reasons.append(
       f"Signature verification failed with the SignerInfo signer certificate: {verification_error}"
@@ -246,6 +265,34 @@ def verify_hardware_attestation(
     if received_bh_bytes != recomputed_bh:
       failure_reasons.append("Body hash (bh) does not match recomputed hash")
 
+  # Email draft Mode 1 has two trust paths. A Registrar-bound message (aid +
+  # bind) takes its authority from the binding JWS, verified against the AIRS
+  # Registry's currentIssuer; its X.509 chain only carries the proof key and
+  # MAY be self-signed or otherwise untrusted (AUD-F20). A message without
+  # aid/bind needs the manufacturer-rooted path.
+  message_is_registrar_bound = bool(parsed.aid and parsed.bind)
+  transient_lookup_failure_reason = ""
+  if message_is_registrar_bound and leaf_certificate is not None and not failure_reasons:
+    try:
+      bind_verification_errors = _verify_registrar_binding_jws(
+        bind_compact_jws=parsed.bind,
+        expected_aid=parsed.aid,
+        expected_typ=parsed.typ,
+        signer_certificate=leaf_certificate,
+        reference_time_unix=reference_time_unix,
+        max_timestamp_skew_seconds=max_timestamp_skew_seconds,
+        current_issuer_resolver=current_issuer_resolver,
+      )
+    except TransientExternalLookupFailure as transient_lookup_failure:
+      transient_lookup_failure_reason = (
+        f"Registrar binding could not be verified now (temperror): {transient_lookup_failure}"
+      )
+      bind_verification_errors = []
+    if bind_verification_errors:
+      failure_reasons.extend(bind_verification_errors)
+    elif not transient_lookup_failure_reason:
+      result.registrar_binding_verified = True
+
   if trusted_root_certificates:
     # AUD-F80/F82: build the path from the SignerInfo signer certificate by
     # issuer name + signature (CertificateSet order means nothing) and apply
@@ -258,40 +305,37 @@ def verify_hardware_attestation(
       trusted_root_certificates=trusted_root_certificates,
       validation_time_utc=datetime.datetime.fromtimestamp(reference_time_unix, tz=datetime.timezone.utc),
     )
-    if chain_validation_error:
+    result.manufacturer_rooted_path_verified = chain_validation_error is None
+    # The manufacturer-rooted result is "fail"; it fails the MESSAGE only when
+    # no Registrar binding established the proof key instead.
+    if chain_validation_error and not result.registrar_binding_verified:
       failure_reasons.append(f"Certificate chain validation failed: {chain_validation_error}")
-  elif not allow_self_signed:
+  elif not message_is_registrar_bound and not allow_self_signed:
     failure_reasons.append(
-      "No trusted root certificates provided and allow_self_signed is False. "
-      "Provide trusted_root_certificates or set allow_self_signed=True for testing."
+      "No trusted root certificates provided and allow_self_signed is False: a message "
+      "without aid/bind needs the manufacturer-rooted path (provide trusted_root_certificates)."
     )
-
-  if parsed.aid and not parsed.bind:
-    failure_reasons.append(
-      "aid is present but bind is absent (sender MUST NOT place aid without Registrar binding)"
-    )
-  elif parsed.bind and not parsed.aid:
-    failure_reasons.append(
-      "bind is present but aid is absent (aid and bind must both appear or both be absent)"
-    )
-
-  if parsed.bind and parsed.aid and leaf_certificate is not None and not failure_reasons:
-    bind_verification_errors = _verify_registrar_binding_jws(
-      bind_compact_jws=parsed.bind,
-      expected_aid=parsed.aid,
-      expected_typ=parsed.typ,
-      signer_certificate=leaf_certificate,
-      reference_time_unix=reference_time_unix if reference_time_unix else int(time.time()),
-      max_timestamp_skew_seconds=max_timestamp_skew_seconds,
-    )
-    failure_reasons.extend(bind_verification_errors)
 
   if failure_reasons:
-    result.failure_reasons = failure_reasons
-    result.failure_reason = failure_reasons[0]
-    return result
+    return _finish_mode1_result(result, "fail", failure_reasons)
+  if transient_lookup_failure_reason:
+    return _finish_mode1_result(result, "temperror", [transient_lookup_failure_reason])
+  if freshness_policy_reason:
+    return _finish_mode1_result(result, "policy", [freshness_policy_reason])
+  return _finish_mode1_result(result, "pass", [])
 
-  result.is_valid = True
+
+def _finish_mode1_result(result: VerificationResult, authentication_results_result: str, reasons: List[str]) -> VerificationResult:
+  """Set the A-R result name, validity and reasons. Draft: tier and aid are
+  reported only when Registrar binding verification succeeded (a
+  manufacturer-only or failed result MUST NOT report an authenticated aid)."""
+  result.authentication_results_result = authentication_results_result
+  result.is_valid = authentication_results_result == "pass"
+  result.failure_reasons = list(reasons)
+  result.failure_reason = reasons[0] if reasons else ""
+  if not result.registrar_binding_verified:
+    result.agent_identity_urn = None
+    result.trust_tier = ""
   return result
 
 
@@ -311,8 +355,11 @@ def _verify_registrar_binding_jws(
   signer_certificate: x509.Certificate,
   reference_time_unix: int,
   max_timestamp_skew_seconds: int = 300,
+  current_issuer_resolver: Optional[Callable[[str], Optional[str]]] = None,
 ) -> List[str]:
-  """Verify a Registrar Binding JWS per RFC Section 5.4.
+  """Verify a Registrar Binding JWS per the email draft "Registrar Binding JWS":
+  iss MUST equal the Registry's currentIssuer for the aid (resolved via RDAP by
+  default), and the key comes ONLY from that issuer's RFC 8414 JWK Set.
 
   Returns a list of failure reasons (empty = success).
   """
@@ -388,13 +435,13 @@ def _verify_registrar_binding_jws(
     else:
       signer_jwk_thumbprint = _compute_jwk_thumbprint_from_certificate(signer_certificate)
       bind_jwk_thumbprint = _compute_jwk_thumbprint_from_jwk_dict(bind_jwk)
-      if signer_jwk_thumbprint and bind_jwk_thumbprint:
-        if signer_jwk_thumbprint != bind_jwk_thumbprint:
-          errors.append(
-            "bind JWS cnf.jwk thumbprint does not match CMS signer public key"
-          )
-      elif not signer_jwk_thumbprint:
+      # AUD-F77: a malformed or unsupported cnf.jwk must fail, not skip the check.
+      if not signer_jwk_thumbprint:
         errors.append("Could not compute JWK thumbprint from CMS signer certificate")
+      elif not bind_jwk_thumbprint:
+        errors.append("bind JWS cnf.jwk is malformed or of an unsupported key type")
+      elif signer_jwk_thumbprint != bind_jwk_thumbprint:
+        errors.append("bind JWS cnf.jwk thumbprint does not match CMS signer public key")
 
   aid_claim = payload.get("aid")
   if isinstance(aid_claim, dict):
@@ -407,31 +454,27 @@ def _verify_registrar_binding_jws(
       )
 
   if not errors:
-    from .issuer_key_discovery import discover_issuer_public_key
-    from urllib.parse import urlparse
-    issuer_domain = urlparse(bind_iss).hostname if bind_iss.startswith("http") else bind_iss
-    bind_kid = header.get("kid")
-    issuer_key = discover_issuer_public_key(issuer_domain, kid=bind_kid) if issuer_domain else None
-    if issuer_key is None:
-      errors.append(
-        f"Could not discover issuer public key for bind JWS issuer {bind_iss!r}"
-      )
+    # AUD-F04: the binding must not bootstrap its own authority. Resolve the
+    # (TransientExternalLookupFailure propagates to the caller -> temperror.)
+    # aid at the Registry, require iss == currentIssuer, and take the key only
+    # from that issuer's RFC 8414 JWK Set (AUD-F50: ES256, RS256 and PS256).
+    from .issuer_key_discovery import discover_registrar_signing_key, verify_compact_jws_signature
+    if current_issuer_resolver is None:
+      from .mode2 import _resolve_issuer_via_rdap as current_issuer_resolver
+    current_issuer = current_issuer_resolver(expected_aid)
+    if not current_issuer:
+      errors.append(f"AIRS identity {expected_aid!r} has no current issuer (Registry resolution failed)")
+    elif bind_iss != current_issuer:
+      errors.append(f"bind JWS iss {bind_iss!r} does not equal the Registry currentIssuer {current_issuer!r}")
     else:
-      from cryptography.exceptions import InvalidSignature as InvSig
-      signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
-      try:
-        if bind_alg == "ES256":
-          sig_for_verify = signature_bytes
-          if len(sig_for_verify) == 64:
-            from .mode2 import _raw_rs_to_der
-            sig_for_verify = _raw_rs_to_der(sig_for_verify)
-          issuer_key.verify(sig_for_verify, signing_input, ec.ECDSA(hashes.SHA256()))
-        else:
-          errors.append(f"Unsupported bind JWS algorithm for verification: {bind_alg}")
-      except InvSig:
-        errors.append("bind JWS signature verification failed")
-      except Exception as sig_error:
-        errors.append(f"bind JWS signature verification error: {sig_error}")
+      issuer_key, discovery_failure = discover_registrar_signing_key(current_issuer, header.get("kid"))
+      if issuer_key is None:
+        errors.append(f"bind JWS issuer key discovery failed: {discovery_failure}")
+      else:
+        signature_failure = verify_compact_jws_signature(
+          issuer_key, bind_alg, f"{parts[0]}.{parts[1]}".encode("ascii"), signature_bytes)
+        if signature_failure:
+          errors.append(f"bind JWS: {signature_failure}")
 
   return errors
 

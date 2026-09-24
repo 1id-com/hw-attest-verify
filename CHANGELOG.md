@@ -1,5 +1,67 @@
 # Changelog
 
+## 2.0.1 (2026-09-24)
+
+Implements the draft's trust paths and result names, so the appendix command
+`python3 -m hw_attest_verify --auth-results --no-time-check --hostname mailpal.com < example.eml`
+verifies the real examples with no trust store.
+
+### Mode 1
+
+- **Registrar-bound path needs no trust store (AUD-F20)**: a message with
+  `aid` and `bind` passes on a verified Registrar binding; its chain only
+  carries the proof key. Without `aid`/`bind` the manufacturer-rooted path
+  (`trusted_root_certificates`) is still required. `registrar_binding_verified`
+  and `manufacturer_rooted_path_verified` record which path(s) succeeded, and
+  `trust_tier` / `agent_identity_urn` are reported only after a verified binding.
+- **Binding authority from the Registry (AUD-F04)**: the `aid` is resolved at
+  the AIRS Registry, `iss` must equal its `currentIssuer`, and the key comes only
+  from that issuer's RFC 8414 metadata `jwks_uri` (new
+  `current_issuer_resolver` argument; default AIRS RDAP).
+- **Binding algorithms (AUD-F50)**: ES256, RS256 and PS256 (salt 32).
+- **Malformed `cnf.jwk` fails (AUD-F77)** instead of skipping the signer-key check.
+- **Freshness is policy (AUD-F49)**: a `ts` outside the window yields `policy`,
+  not `fail`.
+
+### Mode 2
+
+- **Identified mode (AUD-F03)**: a disclosed `sub` is resolved before key
+  discovery; no current issuer = `fail`, an unreachable Registry = `temperror`
+  (was a silent pass).
+- **Hidden mode (AUD-F16)**: only issuers in `trusted_hidden_mode_issuers`
+  (CLI `--trust-hidden-issuer`) are used; others yield `policy`.
+- **RFC 9901 disclosure processing (AUD-F52)**: nested `_sd` and array-element
+  digests, duplicate digests, unreferenced disclosures, collisions, and
+  selectively disclosed `iss`/`iat`/`exp`/`nonce`/`cnf` are handled.
+  `process_sd_jwt_disclosures_per_rfc9901` replaces `_verify_and_extract_disclosures`.
+- **`aid.trust_tier` must be disclosed (AUD-F17)**; **`kid` is required
+  (AUD-F51)**; **ES256, RS256 and PS256** issuer signatures (AUD-F18).
+- **Time rules (AUD-F49)**: a materially future `iat` and an expired `exp` fail;
+  age and token lifetime limits yield `policy` (`max_proof_age_seconds`).
+- **`cnf`**: recorded as `cnf_jwk_thumbprint`; a `cnf`-bearing presentation
+  in a message without `Hardware-Attestation` fails.
+
+### Combined mode (AUD-F19)
+
+- New `apply_combined_mode_requirements_to_mode2_result(mode1, mode2)`: Mode 2
+  passes only if Mode 1 passed, Mode 1 `h=` covers `Hardware-Trust-Proof`,
+  `cnf.jwk` is the CMS signer key, a Mode 1 `aid` equals the disclosed `sub`,
+  and the tiers agree. The CLI applies it; the MailPal milter does too.
+
+### Results and discovery
+
+- Both result classes carry `authentication_results_result`: `pass`, `fail`,
+  `policy`, `temperror` or `permerror` (duplicates, malformed or unsupported
+  input). The CLI prints it in the A-R lines.
+- `TransientExternalLookupFailure` marks lookups that could not complete.
+  Verification no longer uses the `_hwattest` DNS / `{domain}` JWKS discovery.
+- `__version__` now matches the package version.
+
+### Tests
+
+- 223 tests (was 147), including the four real appendix emails verified
+  offline with the Registry and issuer answers recorded on 2026-09-24.
+
 ## 2.0.0 (2026-09-24)
 
 Wire change: both modes always cover nine header fields.
