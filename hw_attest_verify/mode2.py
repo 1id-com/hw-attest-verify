@@ -1,7 +1,7 @@
 """
 Mode 2 verification: Hardware-Trust-Proof header (SD-JWT with selective disclosure).
 
-RFC: draft-drake-email-hardware-attestation-03, Section 6
+RFC: draft-drake-email-hardware-attestation, Section 6
 
 Verification follows the draft's "Verification Algorithm" for Mode 2:
   1. Reject duplicate singleton fields; parse the SD-JWT (all input untrusted).
@@ -31,6 +31,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes, serialization
 
 from .issuer_key_discovery import (
+  AirsIdentityResolutionRejected,
   TransientExternalLookupFailure,
   discover_registrar_signing_key,
   verify_compact_jws_signature,
@@ -206,6 +207,8 @@ def verify_hardware_trust_proof(
       return _finish_mode2_result(result, "temperror", [
         f"AIRS resolution of {candidate_sub!r} could not complete: {transient_lookup_failure}"
       ])
+    except AirsIdentityResolutionRejected as resolution_rejection:
+      return _finish_mode2_result(result, "fail", [str(resolution_rejection)])
     if not current_issuer:
       return _finish_mode2_result(result, "fail", [
         f"AIRS identity {candidate_sub!r} has no current issuer (identified verification fails)"
@@ -579,8 +582,11 @@ def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
 
   Returns None when the identity is unknown (HTTP 404) or has no current
   issuer: Registrar-backed verification then fails. Raises
-  TransientExternalLookupFailure when the lookup cannot complete (network,
-  timeout, HTTP 429/5xx): the result is temperror, never a silent pass (AUD-F03).
+  AirsIdentityResolutionRejected when the answer names another identity or
+  the identity is not operational (Resolution draft, verification steps 2-3;
+  review 072 #2), and TransientExternalLookupFailure when the lookup cannot
+  complete (network, timeout, HTTP 429/5xx): the result is temperror, never a
+  silent pass (AUD-F03).
   """
   import urllib.request
   import urllib.error
@@ -603,7 +609,25 @@ def _resolve_issuer_via_rdap(agent_identity_urn: str) -> Optional[str]:
   except (urllib.error.URLError, TimeoutError, OSError) as network_error:
     raise TransientExternalLookupFailure(f"RDAP {rdap_url}: {network_error}") from network_error
   except json.JSONDecodeError:
-    return None
-  aid_data = data.get("aid_data") if isinstance(data, dict) else None
-  current_issuer = aid_data.get("currentIssuer") if isinstance(aid_data, dict) else None
+    raise AirsIdentityResolutionRejected(f"RDAP answer for {agent_identity_urn!r} is not JSON")
+  return current_issuer_from_rdap_aid_identity_response(agent_identity_urn, data)
+
+
+def current_issuer_from_rdap_aid_identity_response(agent_identity_urn: str, data) -> Optional[str]:
+  """Apply the Resolution draft's response checks to one RDAP answer."""
+  if not isinstance(data, dict) or data.get("objectClassName") != "aid_agentIdentity":
+    raise AirsIdentityResolutionRejected(f"RDAP answer for {agent_identity_urn!r} is not an aid_agentIdentity object")
+  aid_data = data.get("aid_data")
+  if not isinstance(aid_data, dict):
+    raise AirsIdentityResolutionRejected(f"RDAP answer for {agent_identity_urn!r} has no aid_data")
+  if data.get("handle") != agent_identity_urn or aid_data.get("canonical") != agent_identity_urn:
+    raise AirsIdentityResolutionRejected(
+      f"RDAP answer names {aid_data.get('canonical')!r}, not the requested {agent_identity_urn!r}")
+  lifecycle_state = aid_data.get("lifecycleState")
+  if lifecycle_state == "decommissioned":
+    raise AirsIdentityResolutionRejected(f"AIRS identity {agent_identity_urn!r} is decommissioned")
+  if lifecycle_state != "operational":
+    raise AirsIdentityResolutionRejected(
+      f"AIRS identity {agent_identity_urn!r} has lifecycleState {lifecycle_state!r} (must be operational)")
+  current_issuer = aid_data.get("currentIssuer")
   return current_issuer if isinstance(current_issuer, str) and current_issuer else None

@@ -93,6 +93,20 @@ def _sanitize_auth_results_token(value: str) -> str:
   return sanitized.strip() or "unknown"
 
 
+_RFC2045_TOKEN_CHARACTERS = set(
+  "!#$%&'*+-.0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ^_`abcdefghijklmnopqrstuvwxyz{|}~"
+)
+
+
+def _authentication_results_property_value(value: str) -> str:
+  """RFC 8601 pvalue: an RFC 2045 token as is, anything else (a URN or URL
+  contains ':' and '/') as a quoted-string (review 072 #10)."""
+  sanitized = _sanitize_auth_results_token(value)
+  if sanitized and all(character in _RFC2045_TOKEN_CHARACTERS for character in sanitized):
+    return sanitized
+  return '"' + sanitized.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def _format_mode1_auth_results_line(
   hostname: str,
   mode1_result: VerificationResult,
@@ -102,13 +116,13 @@ def _format_mode1_auth_results_line(
   status = mode1_result.authentication_results_result
   line = (
     f"Authentication-Results: {hostname}; hw-attest={status}"
-    f" header.typ={_sanitize_auth_results_token(mode1_result.typ)}"
-    f" header.alg={_sanitize_auth_results_token(mode1_result.alg)}"
+    f" header.typ={_authentication_results_property_value(mode1_result.typ)}"
+    f" header.alg={_authentication_results_property_value(mode1_result.alg)}"
   )
   if mode1_result.trust_tier:
-    line += f" header.tier={_sanitize_auth_results_token(mode1_result.trust_tier)}"
+    line += f" header.tier={_authentication_results_property_value(mode1_result.trust_tier)}"
   if mode1_result.agent_identity_urn:
-    line += f" header.aid={_sanitize_auth_results_token(mode1_result.agent_identity_urn)}"
+    line += f" header.aid={_authentication_results_property_value(mode1_result.agent_identity_urn)}"
   if not mode1_result.is_valid and mode1_result.failure_reason:
     line += f" ({_sanitize_auth_results_token(mode1_result.failure_reason)})"
   return line
@@ -120,22 +134,25 @@ def _format_mode2_auth_results_line(
 ) -> str:
   """Format a Mode 2 result as an Authentication-Results header line.
 
-  Per draft-drake-email-hardware-attestation-03 Section 8 (IANA):
+  Per draft-drake-email-hardware-attestation Section 8 (IANA):
     hw-trust=pass header.mode=identified header.tier=sovereign
       header.issuer=https://1id.com header.aid=urn:aid:global:id-...
   """
   status = mode2_result.authentication_results_result
-  tier = _sanitize_auth_results_token(mode2_result.trust_tier or "unknown")
   mode_value = "identified" if mode2_result.is_identified_mode else "hidden"
 
+  # OWN-033: a property whose value is not known is omitted (like the MailPal
+  # milter does) rather than reported as "unknown", which is no tier value.
   line = (
     f"Authentication-Results: {hostname}; hw-trust={status}"
     f" header.mode={mode_value}"
-    f" header.tier={tier}"
-    f" header.issuer={_sanitize_auth_results_token(mode2_result.issuer or 'unknown')}"
   )
+  if mode2_result.trust_tier:
+    line += f" header.tier={_authentication_results_property_value(mode2_result.trust_tier)}"
+  if mode2_result.issuer:
+    line += f" header.issuer={_authentication_results_property_value(mode2_result.issuer)}"
   if mode2_result.is_identified_mode and mode2_result.agent_identity_urn:
-    line += f" header.aid={_sanitize_auth_results_token(mode2_result.agent_identity_urn)}"
+    line += f" header.aid={_authentication_results_property_value(mode2_result.agent_identity_urn)}"
   if not mode2_result.is_valid and mode2_result.failure_reason:
     line += f" ({_sanitize_auth_results_token(mode2_result.failure_reason)})"
   return line

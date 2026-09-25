@@ -1,7 +1,7 @@
 """
-Combined mode (AUD-F19) and the four real example emails of the draft's
-appendix (sent 2026-09-24 through MailPal with the published oneid 3.0.0 SDK
-on a TPM, a YubiKey PIV, an Apple Secure Enclave and a software key).
+Combined mode (AUD-F19) and the five real example emails of the draft's
+appendix (sent 2026-09-24/25 through MailPal with the published oneid 3.0.0 SDK
+on a TPM, a YubiKey PIV, an Apple Secure Enclave, a VMware vTPM and a software key).
 
 The real emails are verified offline with the answers the live AIRS Registry
 (RDAP currentIssuer) and https://1id.com (RFC 8414 metadata, JWK Set) gave on
@@ -25,6 +25,7 @@ REAL_EXAMPLES = {
   "example_1_sovereign_tpm_combined.eml": ("TPM", "sovereign", "urn:aid:global:id-zjxfv-kmkrf-dgfwt-kzmsz"),
   "example_2_portable_piv_combined.eml": ("PIV", "portable", "urn:aid:global:id-vhfxn-wxmgc-hqtnb-jhvjs"),
   "example_3_enclave_secure_enclave_combined.eml": ("ENC", "enclave", "urn:aid:global:id-xzxgq-ftzrr-zdfvq-gjghn"),
+  "example_4_virtual_vtpm_combined.eml": ("VRT", "virtual", "urn:aid:global:id-bcgnx-ccwrw-xvtgn-vrbxd"),
   "example_5_declared_software_combined.eml": ("SFT", "declared", "urn:aid:global:id-tzptt-rthrs-jfnnf-ppzbp"),
 }
 

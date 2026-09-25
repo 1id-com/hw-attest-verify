@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.0.2 (2026-09-25)
+
+Fixes from the external pre-submission review (rfc/072).
+
+- **AIRS resolution is validated (review #2)**: the RDAP answer must be an
+  `aid_agentIdentity` whose `handle` and `aid_data.canonical` equal the
+  requested aid, with `lifecycleState` `operational`. A decommissioned
+  identity, an answer for another identity, or an unknown lifecycle state now
+  fails both modes with that reason (`AirsIdentityResolutionRejected`) instead
+  of passing. A missing `currentIssuer` still means "no current issuer".
+- **Authentication-Results values are RFC 8601 values (review #10)**: a value
+  that is not an RFC 2045 token -- the `aid` URN and the `issuer` URL -- is
+  written as a quoted-string, e.g. `header.aid="urn:aid:global:..."`, as in the
+  draft's own examples.
+- CLI Authentication-Results: `header.tier` and `header.issuer` are omitted
+  when there is no value (a hidden-mode `policy` result printed
+  `header.tier=unknown`, which is no tier value; OWN-033).
+- References to the email draft no longer pin a revision.
+
 ## 2.0.1 (2026-09-24)
 
 Implements the draft's trust paths and result names, so the appendix command

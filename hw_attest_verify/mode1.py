@@ -1,7 +1,7 @@
 """
 Mode 1 verification: Hardware-Attestation header (CMS SignedData).
 
-RFC: draft-drake-email-hardware-attestation-03, Section 5
+RFC: draft-drake-email-hardware-attestation, Section 5
 
 Verification steps:
   1. Parse the header parameters (v, typ, alg, h, bh, ts, chain)
@@ -461,7 +461,11 @@ def _verify_registrar_binding_jws(
     from .issuer_key_discovery import discover_registrar_signing_key, verify_compact_jws_signature
     if current_issuer_resolver is None:
       from .mode2 import _resolve_issuer_via_rdap as current_issuer_resolver
-    current_issuer = current_issuer_resolver(expected_aid)
+    from .issuer_key_discovery import AirsIdentityResolutionRejected
+    try:
+      current_issuer = current_issuer_resolver(expected_aid)
+    except AirsIdentityResolutionRejected as resolution_rejection:
+      return errors + [str(resolution_rejection)]
     if not current_issuer:
       errors.append(f"AIRS identity {expected_aid!r} has no current issuer (Registry resolution failed)")
     elif bind_iss != current_issuer:

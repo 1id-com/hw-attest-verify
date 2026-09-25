@@ -1,6 +1,6 @@
 """
 Combined mode: a message carrying both Hardware-Attestation and
-Hardware-Trust-Proof (draft-drake-email-hardware-attestation-03, "Combined Mode").
+Hardware-Trust-Proof (draft-drake-email-hardware-attestation, "Combined Mode").
 
 Combined mode is meaningful only when the two artifacts concern the same
 message and the same Mode-1 signing key, so the Mode 2 presentation passes only

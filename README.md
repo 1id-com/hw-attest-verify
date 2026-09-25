@@ -2,7 +2,7 @@
 
 Verification library for RFC `Hardware-Attestation` and `Hardware-Trust-Proof` email headers.
 
-Receiving mail servers use this library to verify that an email was sent from a hardware-attested identity, as defined in [draft-drake-email-hardware-attestation-03](https://1id.com/rfc/).
+Receiving mail servers use this library to verify that an email was sent from a hardware-attested identity, as defined in [draft-drake-email-hardware-attestation](https://1id.com/rfc/).
 
 ## Installation
 
@@ -146,7 +146,7 @@ uses it; the `[dns]` extra is no longer needed.)
 
 ## RFC Reference
 
-[draft-drake-email-hardware-attestation-03](https://1id.com/rfc/draft-drake-email-hardware-attestation-03.html) -- Hardware Attestation for Email Sender Verification
+[draft-drake-email-hardware-attestation](https://datatracker.ietf.org/doc/draft-drake-email-hardware-attestation/) -- Hardware Attestation for Email Sender Verification
 
 ## License
 
@@ -156,7 +156,7 @@ MIT
 ## Spec -> code traceability (G6.3)
 
 This is C3, the offline verifier for
-`draft-drake-email-hardware-attestation-03`. Paths relative to this
+`draft-drake-email-hardware-attestation`. Paths relative to this
 package.
 
 | Draft section | Implementing file(s) |

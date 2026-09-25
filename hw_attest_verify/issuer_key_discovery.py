@@ -1,7 +1,7 @@
 """
 Issuer public key discovery for Hardware-Trust-Proof (Mode 2) verification.
 
-RFC: draft-drake-email-hardware-attestation-03, Section 4
+RFC: draft-drake-email-hardware-attestation, Section 4
 
 Two discovery mechanisms, tried in order:
   1. DNS TXT record at _hwattest.{domain} (preferred, no HTTPS fetch needed)
@@ -190,6 +190,13 @@ def _load_ec_public_key_from_jwk(jwk: dict) -> ec.EllipticCurvePublicKey:
 
 _RFC8414_CACHE_SECONDS = 300
 _registrar_jwk_set_cache: dict = {}
+
+
+class AirsIdentityResolutionRejected(ValueError):
+  """The AIRS Registry answered, but the answer does not allow Registrar-backed
+  authentication of this aid (draft-drake-agent-identity-resolution: the response
+  must name exactly this canonical aid and its lifecycleState must be
+  operational). Verifiers report fail with this reason."""
 
 
 class TransientExternalLookupFailure(Exception):

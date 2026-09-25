@@ -5,7 +5,7 @@ Implements verification for:
   Mode 1: Hardware-Attestation (CMS SignedData with hardware cert chain)
   Mode 2: Hardware-Trust-Proof (SD-JWT with selective disclosure)
 
-RFC: draft-drake-email-hardware-attestation-03
+RFC: draft-drake-email-hardware-attestation
 
 Usage:
     # Mode 1 (Direct Hardware Attestation)
@@ -26,18 +26,19 @@ Usage:
 """
 
 from .combined import apply_combined_mode_requirements_to_mode2_result
-from .issuer_key_discovery import TransientExternalLookupFailure
+from .issuer_key_discovery import AirsIdentityResolutionRejected, TransientExternalLookupFailure
 from .mode1 import verify_hardware_attestation, VerificationResult
 from .mode2 import verify_hardware_trust_proof, Mode2VerificationResult
 from .parse import parse_hardware_attestation_header
 
-__version__ = "2.0.1"
+__version__ = "2.0.2"
 
 __all__ = [
   "verify_hardware_attestation",
   "verify_hardware_trust_proof",
   "apply_combined_mode_requirements_to_mode2_result",
   "TransientExternalLookupFailure",
+  "AirsIdentityResolutionRejected",
   "parse_hardware_attestation_header",
   "VerificationResult",
   "Mode2VerificationResult",
