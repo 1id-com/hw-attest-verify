@@ -1,17 +1,20 @@
 """
-Issuer public key discovery for Hardware-Trust-Proof (Mode 2) verification.
+Registrar signing-key discovery for Hardware-Trust-Proof (Mode 2) and the
+Registrar Binding JWS (Mode 1 bind).
 
-RFC: draft-drake-email-hardware-attestation, Section 4
+RFC: draft-drake-email-hardware-attestation, "Authoritative Registrar Key
+Discovery" (hw-attest-verify >= 2.0.1).
 
-Two discovery mechanisms, tried in order:
-  1. DNS TXT record at _hwattest.{domain} (preferred, no HTTPS fetch needed)
-  2. HTTPS JWKS at {issuer}/.well-known/jwks.json (fallback)
+Verification paths use ONLY the authoritative route: resolve the aid at the
+AIRS Registry (RDAP), take its currentIssuer, fetch RFC 8414 Authorization
+Server Metadata for exactly that issuer (metadata.issuer must equal it), and
+take signing keys only from that metadata's jwks_uri
+(fetch_registrar_jwk_set_via_rfc8414_metadata / discover_registrar_signing_key).
+A token or binding never bootstraps its own authority (AUD-F04).
 
-The DNS record format:
-  _hwattest.1id.com.  IN TXT "v=hwattest1; alg=ES256; p=MFkwEwYH..."
-
-The p= tag contains the base64-encoded SubjectPublicKeyInfo DER encoding
-of the issuer's EC P-256 public key.
+The older discovery helpers further down (DNS TXT _hwattest.{domain} and
+{issuer}/.well-known/jwks.json) are kept only for API compatibility; no
+verification path calls them.
 """
 
 from __future__ import annotations
