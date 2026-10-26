@@ -1,7 +1,7 @@
 """
 Mode 2 verification: Hardware-Trust-Proof header (SD-JWT with selective disclosure).
 
-RFC: draft-drake-email-hardware-attestation, Section 6
+RFC: draft-drake-email-hardware-attestation-03, Section "Mode 2: SD-JWT Trust Proof"
 
 Verification follows the draft's "Verification Algorithm" for Mode 2:
   1. Reject duplicate singleton fields; parse the SD-JWT (all input untrusted).
@@ -11,10 +11,14 @@ Verification follows the draft's "Verification Algorithm" for Mode 2:
   3. RFC 8414 key discovery for that issuer; verify the JWS (ES256, RS256,
      PS256) and the disclosures per RFC 9901; require aid.trust_tier; reject
      a cnf-bearing presentation without a Hardware-Attestation field.
-  4. Require iat and nonce; reject a materially future iat; enforce exp.
-  5. Recompute the message-binding nonce and require equality.
+  4. Require iat and nonce; reject a materially future iat; enforce exp: an
+     expired token is `policy` with the cause in the comment (EML-02).
+  5. Recompute the message-binding nonce (13 always-covered fields, EML-11)
+     and require equality.
   6. Receiver-local age policy on iat (a policy result, not a failure).
-  7. Report identified (with the verified sub) or hidden.
+  7. Report identified (with the verified sub) or hidden. A sub in the
+     Registry's test namespace is `policy` with no tier or aid reported
+     (EML-13).
 """
 
 from __future__ import annotations
@@ -58,6 +62,9 @@ def _unfold_mime_header_value(raw_value: str) -> str:
 _DEFAULT_MAX_TOKEN_LIFETIME_SECONDS = 3600
 _DEFAULT_MAX_TIMESTAMP_SKEW_SECONDS = 300
 
+# Email draft -03 EML-13: an aid in the Registry's test namespace carries no production assurance.
+_REGISTRY_TEST_NAMESPACE_AID_URN_PREFIX_LOWERCASE = "urn:aid:test:"
+
 
 @dataclass
 class Mode2VerificationResult:
@@ -79,6 +86,11 @@ class Mode2VerificationResult:
   # thumbprint of its jwk ("" when absent or malformed).
   carries_cnf_claim: bool = False
   cnf_jwk_thumbprint: str = ""
+  # EML-13: the disclosed sub is in the Registry's test namespace (urn:aid:test:), which carries no production
+  # assurance. The result is `policy` and no tier or aid is reported (trust_tier and agent_identity_urn stay empty).
+  disclosed_sub_is_in_the_registry_test_namespace: bool = False
+  # EML-02: the token's exp has passed. The result is `policy` with the cause in the comment, not `fail`.
+  token_has_expired: bool = False
 
 
 _ACCEPTED_ISSUER_JWS_ALGORITHMS = ("ES256", "RS256", "PS256")
@@ -269,7 +281,13 @@ def verify_hardware_trust_proof(
     if iat > reference_time_unix + max_timestamp_skew_seconds:
       failure_reasons.append(f"iat {iat} is materially in the future (reference time {reference_time_unix})")
     if exp is not None and exp < reference_time_unix:
-      failure_reasons.append(f"Token has expired (exp={exp}, now={reference_time_unix})")
+      # Draft -03 (EML-02): "delivery delay does not make an expired JWT valid. An expired token is reported as
+      # policy, with the cause in the comment." The signature and the nonce are still checked below, so a forged
+      # expired token stays a failure.
+      result.token_has_expired = True
+      policy_reasons.append(
+        f"Token has expired (exp={exp}, now={reference_time_unix}); delivery delay does not make an expired token valid"
+      )
     # AUD-F49: age and lifetime limits are receiver policy, not forgery.
     if reference_time_unix - iat > max_proof_age_seconds:
       policy_reasons.append(
@@ -292,6 +310,17 @@ def verify_hardware_trust_proof(
   }
   result.agent_identity_urn = candidate_sub or ""
   result.is_identified_mode = bool(candidate_sub)
+
+  if candidate_sub and candidate_sub.lower().startswith(_REGISTRY_TEST_NAMESPACE_AID_URN_PREFIX_LOWERCASE):
+    # Draft -03 (EML-13): "A verifier applying production policy MUST report it as policy, and MUST NOT report a tier
+    # or aid property for it." The checks above still ran, so a forged test-namespace token stays a failure.
+    result.disclosed_sub_is_in_the_registry_test_namespace = True
+    result.trust_tier = ""
+    result.agent_identity_urn = ""
+    policy_reasons.append(
+      f"The disclosed sub {candidate_sub!r} is in the Registry's test namespace (urn:aid:test:) and carries no "
+      "production assurance; no tier or aid is reported"
+    )
 
   if failure_reasons:
     return _finish_mode2_result(result, "fail", failure_reasons)
@@ -539,7 +568,7 @@ def _compute_message_binding_nonce(
 
   Uses the SD-JWT's iat for ts-bytes, per the RFC verification algorithm.
 
-  email-03 Mode 2 covers a FIXED set: the nine always-covered fields
+  email-03 Mode 2 covers a FIXED set: the thirteen always-covered fields
   (ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER), in THAT order, each once -- no oversigning and no bottom-up
   selection (that is a Mode 1 behavior; Mode 1 carries an explicit h=
   list, Mode 2 does not, so its covered set must be fixed and known to

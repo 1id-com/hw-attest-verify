@@ -1,13 +1,20 @@
 """
-Mode 1 Registrar-bound trust path (hw-attest-verify 2.0.1): AUD-F20 (no trust
-store needed when aid/bind verify), AUD-F04 (iss must equal the Registry's
-currentIssuer; key only from that issuer's RFC 8414 JWK Set), AUD-F50 (ES256,
-RS256 and PS256 binding JWS), AUD-F77 (a malformed cnf.jwk fails), plus the
-draft's A-R result names and "tier and aid only after Registrar binding".
+Mode 1 Registrar-bound trust path: AUD-F20 (no trust store needed when
+aid/bind verify), AUD-F04 (iss must equal the Registry's currentIssuer; key
+only from that issuer's RFC 8414 JWK Set), AUD-F50 (ES256, RS256 and PS256
+binding JWS), AUD-F77 (a malformed cnf.jwk fails), plus the draft's A-R result
+names and "tier and aid only after Registrar binding".
+
+Draft -03 changes tested here: the Registrar-bound path is the ONLY trust path
+(EML-01, EML-07: the manufacturer-rooted path is reserved, so a certificate path
+to a local root never makes `pass`), a valid signature with no trust path is
+`policy`, an expired binding assertion is `policy` with the cause (EML-02), an
+aid in the test namespace is `policy` with no tier or aid (EML-13), and the
+binding must carry its aid claim object.
 
 Real Mode 1 messages are signed with the generated PKI of the CMS profile
-tests; the Registry (currentIssuer) and the issuer's HTTPS documents are the
-only stubbed inputs.
+tests over the independently computed 92-octet attestation-input; the Registry
+(currentIssuer) and the issuer's HTTPS documents are the only stubbed inputs.
 """
 
 import base64
@@ -25,7 +32,8 @@ from hw_attest_verify import issuer_key_discovery
 from tests.test_mode1_cms_profile_and_certificate_path import (
   BODY,
   EMAIL_HEADERS,
-  NINE_ALWAYS_COVERED_FIELDS,
+  MODE1_LABEL,
+  THIRTEEN_ALWAYS_COVERED_FIELDS,
   REFERENCE_TIME_UNIX,
   SIGNATURE_ALGORITHM_BY_NAME,
   GeneratedPkiForMode1Tests,
@@ -78,10 +86,15 @@ class Registrar:
         signing_input, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=32), hashes.SHA256())
     return f"{signing_input.decode()}.{b64url(signature)}"
 
-  def binding_jws(self, cnf_jwk, alg="ES256", kid=None, iss=REGISTRAR_ISSUER, trust_tier="declared", signing_key=None):
+  def binding_jws(self, cnf_jwk, alg="ES256", kid=None, iss=REGISTRAR_ISSUER, trust_tier="declared", signing_key=None,
+                  sub=AID, iat=REFERENCE_TIME_UNIX, exp=REFERENCE_TIME_UNIX + 300, payload_overrides=None,
+                  omit_claims=()):
     header = {"alg": alg, "kid": kid or ("reg-es256" if alg == "ES256" else "reg-rsa"), "typ": "airs-email-binding+jwt"}
-    payload = {"iss": iss, "sub": AID, "iat": REFERENCE_TIME_UNIX, "exp": REFERENCE_TIME_UNIX + 300,
+    payload = {"iss": iss, "sub": sub, "iat": iat, "exp": exp,
                "cnf": {"jwk": cnf_jwk}, "aid": {"trust_tier": trust_tier}}
+    payload.update(payload_overrides or {})
+    for claim_name in omit_claims:
+      payload.pop(claim_name, None)
     return self.sign(alg, header, payload, signing_key)
 
 
@@ -118,15 +131,16 @@ def issuer_documents(registrar, monkeypatch):
 
 
 def signed_header_value(pki, tail_tags: str, typ="SFT") -> str:
-  """A real Mode 1 header: ES256 over the draft's attestation-input, with the
+  """A real Mode 1 header: ES256 over the draft's 92-octet attestation-input, with the
   chain value empty in the signed copy (self-reference) and aid/bind after it."""
   bh = b64url(hashlib.sha256(BODY).digest())
-  head = f"v=1; typ={typ}; alg=ES256; h={':'.join(NINE_ALWAYS_COVERED_FIELDS)}; bh={bh}; ts={REFERENCE_TIME_UNIX}; chain="
+  head = f"v=1; typ={typ}; alg=ES256; h={':'.join(THIRTEEN_ALWAYS_COVERED_FIELDS)}; bh={bh}; ts={REFERENCE_TIME_UNIX}; chain="
   lowered = {name.lower(): value for name, value in EMAIL_HEADERS.items()}
-  canonical = "".join(f"{name}:{lowered[name]}\r\n" for name in NINE_ALWAYS_COVERED_FIELDS if name in lowered)
+  canonical = "".join(f"{name}:{lowered[name]}\r\n" for name in THIRTEEN_ALWAYS_COVERED_FIELDS if name in lowered)
   canonical += "hardware-attestation:" + (head + tail_tags).replace(" ", "") + "\r\n"
-  attestation_input = (hashlib.sha256(canonical.encode()).digest() + hashlib.sha256(BODY).digest()
+  attestation_input = (MODE1_LABEL + hashlib.sha256(canonical.encode()).digest() + hashlib.sha256(BODY).digest()
                        + struct.pack(">Q", REFERENCE_TIME_UNIX))
+  assert len(attestation_input) == 92
   cms = build_signed_data(
     signature=pki.ec_leaf_key.sign(attestation_input, ec.ECDSA(hashes.SHA256())),
     certificates_in_set_order=[pki.ec_leaf, pki.intermediate, pki.root],
@@ -136,22 +150,24 @@ def signed_header_value(pki, tail_tags: str, typ="SFT") -> str:
   return head + base64.b64encode(cms).decode() + tail_tags
 
 
-def verify(header_value, current_issuer=REGISTRAR_ISSUER, trusted_roots=None, reference_time=REFERENCE_TIME_UNIX):
+def verify(header_value, current_issuer=REGISTRAR_ISSUER, trusted_roots=None, reference_time=REFERENCE_TIME_UNIX,
+           expected_aid=AID, **verifier_policy_arguments):
   def resolver(aid):
-    assert aid == AID
+    assert aid == expected_aid
     if isinstance(current_issuer, Exception):
       raise current_issuer
     return current_issuer
   return verify_hardware_attestation(
     header_value=header_value, email_headers=EMAIL_HEADERS, body=BODY,
     trusted_root_certificates=trusted_roots, reference_time_unix=reference_time,
-    current_issuer_resolver=resolver,
+    current_issuer_resolver=resolver, **verifier_policy_arguments,
   )
 
 
-def bound_header(pki, registrar, **binding_arguments):
+def bound_header(pki, registrar, aid=AID, **binding_arguments):
   cnf_jwk = binding_arguments.pop("cnf_jwk", None) or ec_public_jwk(pki.ec_leaf_key.public_key())
-  return signed_header_value(pki, f"; aid={AID}; bind={registrar.binding_jws(cnf_jwk, **binding_arguments)}")
+  binding_arguments.setdefault("sub", aid)
+  return signed_header_value(pki, f"; aid={aid}; bind={registrar.binding_jws(cnf_jwk, **binding_arguments)}")
 
 
 def assert_result(result, expected_result, reason_fragment=""):
@@ -166,26 +182,40 @@ class TestRegistrarBoundPathNeedsNoTrustStoreAudF20:
     result = verify(bound_header(pki, registrar))
     assert_result(result, "pass")
     assert result.registrar_binding_verified
+    assert result.trust_path_that_succeeded == "registrar"
     assert result.manufacturer_rooted_path_verified is None
     assert result.agent_identity_urn == AID
     assert result.trust_tier == "declared"
+    assert result.cms_signature_and_message_binding_verified
 
-  def test_failed_manufacturer_path_does_not_fail_a_verified_binding(self, pki, registrar, issuer_documents):
+  def test_a_failed_path_to_local_roots_does_not_fail_a_verified_binding(self, pki, registrar, issuer_documents):
+    # Draft -03 (EML-07): a certificate path to a local root is diagnostic only, never a trust path, so it cannot
+    # fail (or help) a message whose Registrar binding verified.
     result = verify(bound_header(pki, registrar), trusted_roots=[pki.unrelated_root])
     assert_result(result, "pass")
-    assert result.manufacturer_rooted_path_verified is False
+    assert result.manufacturer_rooted_path_verified is None
+    assert result.signer_certificate_path_to_supplied_roots_is_valid is False
 
-  def test_both_paths_recorded_when_both_verify(self, pki, registrar, issuer_documents):
+  def test_a_valid_path_to_local_roots_is_not_reported_as_a_manufacturer_path(self, pki, registrar, issuer_documents):
+    # EML-07: this version names no manufacturer-rooted evidence profile; "invent such evidence and report it as this
+    # profile" is forbidden, so the path stays "registrar" even when the signer certificate chains to a supplied root.
     result = verify(bound_header(pki, registrar), trusted_roots=[pki.root])
     assert_result(result, "pass")
-    assert result.registrar_binding_verified and result.manufacturer_rooted_path_verified
+    assert result.registrar_binding_verified and result.trust_path_that_succeeded == "registrar"
+    assert result.manufacturer_rooted_path_verified is None
+    assert result.signer_certificate_path_to_supplied_roots_is_valid is True
 
-  def test_unbound_message_still_needs_the_manufacturer_path(self, pki, issuer_documents):
-    assert_result(verify(signed_header_value(pki, "")), "fail", "manufacturer-rooted path")
+  def test_unbound_message_has_no_trust_path_and_is_policy_not_fail(self, pki, issuer_documents):
+    # EML-01: "a valid CMS signature with no successful path ... is reported as policy".
+    result = verify(signed_header_value(pki, ""))
+    assert_result(result, "policy", "no trust path was established")
+    assert result.cms_signature_and_message_binding_verified and result.trust_path_that_succeeded == ""
 
-  def test_manufacturer_only_result_reports_no_aid_and_no_tier(self, pki, issuer_documents):
+  def test_unbound_message_with_a_valid_path_to_local_roots_is_still_policy(self, pki, issuer_documents):
     result = verify(signed_header_value(pki, ""), trusted_roots=[pki.root])
-    assert_result(result, "pass")
+    assert_result(result, "policy", "no trust path was established")
+    assert result.manufacturer_rooted_path_verified is None
+    assert result.signer_certificate_path_to_supplied_roots_is_valid is True
     assert result.agent_identity_urn is None and result.trust_tier == ""
     assert not result.registrar_binding_verified
 
@@ -254,9 +284,215 @@ class TestResultNamesFromTheDraft:
     result = verify(signed_header_value(pki, ""), trusted_roots=[pki.root], reference_time=REFERENCE_TIME_UNIX + 86400)
     assert_result(result, "policy", "local freshness policy")
 
+  def test_stale_timestamp_on_a_bound_message_is_policy_for_that_reason_alone(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, exp=REFERENCE_TIME_UNIX + 200000),
+                    reference_time=REFERENCE_TIME_UNIX + 86400)
+    assert_result(result, "policy", "local freshness policy")
+    assert len(result.failure_reasons) == 1
+    assert result.registrar_binding_verified and result.trust_path_that_succeeded == "registrar"
+
   def test_signer_key_thumbprint_and_h_list_are_recorded_for_combined_mode(self, pki, registrar, issuer_documents):
     result = verify(bound_header(pki, registrar))
     from hw_attest_verify.mode1 import _compute_jwk_thumbprint_from_jwk_dict
     assert result.signer_public_key_jwk_thumbprint == _compute_jwk_thumbprint_from_jwk_dict(
       ec_public_jwk(pki.ec_leaf_key.public_key()))
-    assert [name.lower() for name in result.signed_header_names] == NINE_ALWAYS_COVERED_FIELDS
+    assert [name.lower() for name in result.signed_header_names] == THIRTEEN_ALWAYS_COVERED_FIELDS
+
+
+class TestExpiredBindingAssertionIsPolicyEml02:
+  """Draft -03 "Registrar Binding JWS": "A verifier that finds the assertion expired reports policy, with the cause in
+  the comment, not fail: the CMS signature verified, and the Registrar's assertion was no longer current when
+  checked." The skew allowance is the verifier's normal small clock-skew allowance (300 s by default)."""
+
+  def test_expired_but_genuine_binding_is_policy_with_the_cause(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 3600, exp=REFERENCE_TIME_UNIX - 600))
+    assert_result(result, "policy", "binding assertion has expired")
+    assert result.registrar_assertion_has_expired
+    assert result.cms_signature_and_message_binding_verified
+    assert not result.registrar_binding_verified and result.trust_path_that_succeeded == ""
+    assert result.agent_identity_urn is None and result.trust_tier == ""
+
+  def test_expiry_inside_the_clock_skew_allowance_still_passes(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 3600, exp=REFERENCE_TIME_UNIX - 300))
+    assert_result(result, "pass")
+    assert not result.registrar_assertion_has_expired
+
+  def test_expiry_one_second_beyond_the_clock_skew_allowance_is_policy(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 3600, exp=REFERENCE_TIME_UNIX - 301))
+    assert_result(result, "policy", "binding assertion has expired")
+
+  def test_forged_expired_binding_stays_a_failure(self, pki, registrar, issuer_documents):
+    attacker_key = ec.generate_private_key(ec.SECP256R1())
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 3600, exp=REFERENCE_TIME_UNIX - 600,
+                                 signing_key=attacker_key))
+    assert_result(result, "fail", "signature verification failed")
+    assert not result.registrar_assertion_has_expired
+
+  def test_expired_binding_from_the_wrong_issuer_stays_a_failure(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 3600, exp=REFERENCE_TIME_UNIX - 600),
+                    current_issuer="https://other-registrar.example/agents")
+    assert_result(result, "fail", "does not equal the Registry currentIssuer")
+
+  def test_exp_that_is_not_later_than_iat_is_still_a_failure(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX, exp=REFERENCE_TIME_UNIX))
+    assert_result(result, "fail", "exp must be later than iat")
+
+  def test_iat_materially_in_the_future_is_a_failure(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX + 301, exp=REFERENCE_TIME_UNIX + 900))
+    assert_result(result, "fail", "iat is in the future")
+
+
+class TestTestNamespaceIdentityIsPolicyEml13:
+  """Draft -03 `agent-identity-format`: "An aid in the Registry's test namespace (urn:aid:test:) carries no
+  production assurance. A verifier applying production policy MUST report it as policy, and MUST NOT report a tier or
+  aid property for it." The binding is still checked in full, so a forged one is a failure."""
+
+  TEST_AID = "urn:aid:test:id-qkckh-xxtcw-cxbvp-gpskg"
+
+  def test_genuine_test_namespace_binding_is_policy_with_no_tier_and_no_aid(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar, aid=self.TEST_AID), expected_aid=self.TEST_AID)
+    assert_result(result, "policy", "test namespace")
+    assert result.aid_is_in_the_registry_test_namespace
+    assert result.agent_identity_urn is None and result.trust_tier == ""
+    assert result.cms_signature_and_message_binding_verified
+
+  def test_the_namespace_prefix_compares_case_insensitively(self, pki, registrar, issuer_documents):
+    mixed_case_aid = "URN:AID:Test:id-qkckh-xxtcw-cxbvp-gpskg"
+    result = verify(bound_header(pki, registrar, aid=mixed_case_aid), expected_aid=mixed_case_aid)
+    assert_result(result, "policy", "test namespace")
+    assert result.agent_identity_urn is None and result.trust_tier == ""
+
+  def test_forged_test_namespace_binding_is_still_a_failure(self, pki, registrar, issuer_documents):
+    attacker_key = ec.generate_private_key(ec.SECP256R1())
+    result = verify(bound_header(pki, registrar, aid=self.TEST_AID, signing_key=attacker_key), expected_aid=self.TEST_AID)
+    assert_result(result, "fail", "signature verification failed")
+    assert result.agent_identity_urn is None and result.trust_tier == ""
+
+  def test_production_namespace_is_unaffected(self, pki, registrar, issuer_documents):
+    result = verify(bound_header(pki, registrar))
+    assert_result(result, "pass")
+    assert not result.aid_is_in_the_registry_test_namespace
+    assert result.agent_identity_urn == AID and result.trust_tier == "declared"
+
+
+class TestBindingClaimObjectIsRequiredAndMalformedClaimsFailClosed:
+  """Draft -03: the binding's `aid` claim object is REQUIRED ("Its trust_tier member reports the tier of this enrolled
+  proof binding") and trust_tier MUST correspond to typ. A hostile claim of the wrong JSON type is a failure, never an
+  exception."""
+
+  @pytest.mark.parametrize("payload_overrides, omit_claims, reason_fragment", [
+    ({}, ("aid",), "missing the aid claim object"),
+    ({"aid": {}}, (), "missing the aid claim object"),
+    ({"aid": {"trust_tier": ""}}, (), "missing the aid claim object"),
+    ({"aid": "declared"}, (), "missing the aid claim object"),
+    ({"aid": ["declared"]}, (), "missing the aid claim object"),
+    ({"aid": {"trust_tier": "sovereign"}}, (), "does not match expected tier for typ='SFT'"),
+  ])
+  def test_aid_claim_object_problems_fail(self, pki, registrar, issuer_documents, payload_overrides, omit_claims, reason_fragment):
+    header = bound_header(pki, registrar, payload_overrides=payload_overrides, omit_claims=omit_claims)
+    assert_result(verify(header), "fail", reason_fragment)
+
+  @pytest.mark.parametrize("claim_name", ["iat", "exp"])
+  @pytest.mark.parametrize("bad_value", ["1790000000", True, None, [1790000000], {"n": 1}])
+  def test_a_numeric_date_claim_that_is_not_a_number_is_a_failure_not_an_exception(
+      self, pki, registrar, issuer_documents, claim_name, bad_value):
+    header = bound_header(pki, registrar, payload_overrides={claim_name: bad_value})
+    result = verify(header)
+    assert result.authentication_results_result == "fail", result.failure_reasons
+    assert any(claim_name in reason for reason in result.failure_reasons), result.failure_reasons
+
+  @pytest.mark.parametrize("claim_name", ["iat", "exp"])
+  def test_a_non_finite_numeric_date_is_a_failure_not_an_exception(self, pki, registrar, issuer_documents, claim_name):
+    # json.loads accepts the non-standard literals NaN and Infinity by default; int() of either raises.
+    bind_value = registrar.binding_jws(ec_public_jwk(pki.ec_leaf_key.public_key()))
+    header_b64, payload_b64, signature_b64 = bind_value.split(".")
+    payload_text = base64.urlsafe_b64decode(payload_b64 + "=" * (-len(payload_b64) % 4)).decode()
+    tampered_payload = payload_text.replace(f'"{claim_name}": ', f'"{claim_name}": Infinity, "x": ', 1)
+    assert "Infinity" in tampered_payload
+    tampered_bind = f"{header_b64}.{b64url(tampered_payload.encode())}.{signature_b64}"
+    # The tampered binding is carried inside a freshly CMS-signed header, so the Mode 1 signature itself is valid
+    # and only the binding claim is hostile.
+    result = verify(signed_header_value(pki, f"; aid={AID}; bind={tampered_bind}"))
+    assert result.authentication_results_result == "fail", result.failure_reasons
+    assert any(claim_name in reason for reason in result.failure_reasons), result.failure_reasons
+
+  def test_a_binding_whose_header_is_not_a_json_object_is_a_failure(self, pki, registrar, issuer_documents):
+    not_an_object = f"{b64url(b'[1]')}.{b64url(b'{}')}.{b64url(b'x')}"
+    result = verify(signed_header_value(pki, f"; aid={AID}; bind={not_an_object}"))
+    assert_result(result, "fail", "must each be a JSON object")
+
+
+class TestHeaderSizeLimit:
+  """Draft -03 "Header Size Considerations": "A verifier SHOULD reject a field larger than its local limit as permerror
+  without decoding it.\""""
+
+  def test_a_field_over_the_local_limit_is_permerror_without_decoding(self, pki, registrar, issuer_documents):
+    header = bound_header(pki, registrar)
+    result = verify_hardware_attestation(
+      header_value=header, email_headers=EMAIL_HEADERS, body=BODY, reference_time_unix=REFERENCE_TIME_UNIX,
+      maximum_header_field_value_octets=len(header) - 1,
+      current_issuer_resolver=lambda aid: REGISTRAR_ISSUER)
+    assert_result(result, "permerror", "over the local limit")
+
+  def test_a_field_exactly_at_the_limit_is_processed(self, pki, registrar, issuer_documents):
+    header = bound_header(pki, registrar)
+    result = verify_hardware_attestation(
+      header_value=header, email_headers=EMAIL_HEADERS, body=BODY, reference_time_unix=REFERENCE_TIME_UNIX,
+      maximum_header_field_value_octets=len(header),
+      current_issuer_resolver=lambda aid: REGISTRAR_ISSUER)
+    assert_result(result, "pass")
+
+
+class TestTimestampStalenessIsALocalPolicySeparateFromClockSkew:
+  """Draft -03 step 3: "Apply local freshness policy to ts. A stale but otherwise cryptographically valid proof is a
+  policy outcome." A receiver that verifies after queueing and greylisting (the first trusted MTA) accepts a ts as old
+  as the Registrar mail assertion lifetime; that must not also accept a ts from the future."""
+
+  ONE_HOUR = 3600
+  A_BINDING_THAT_OUTLIVES_EVERY_REFERENCE_TIME_USED_HERE = REFERENCE_TIME_UNIX + 400000
+
+  def bound(self, pki, registrar):
+    # The binding was issued a day before the proof: a binding iat in the future would be a (correct) ail of its own
+    # in the from-the-future cases, and these tests are about ts.
+    return bound_header(pki, registrar, iat=REFERENCE_TIME_UNIX - 86400,
+                        exp=self.A_BINDING_THAT_OUTLIVES_EVERY_REFERENCE_TIME_USED_HERE)
+
+  def test_default_policy_is_unchanged_a_ts_300_seconds_old_passes_and_301_is_policy(self, pki, registrar, issuer_documents):
+    assert_result(verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + 300), "pass")
+    assert_result(verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + 301), "policy", "ts is 301s old")
+
+  def test_a_longer_age_allowance_accepts_a_ts_one_hour_old(self, pki, registrar, issuer_documents):
+    result = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + self.ONE_HOUR,
+                    max_timestamp_age_seconds=self.ONE_HOUR)
+    assert_result(result, "pass")
+
+  def test_a_ts_beyond_the_longer_age_allowance_is_policy_and_names_the_allowance(self, pki, registrar, issuer_documents):
+    result = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + self.ONE_HOUR + 1,
+                    max_timestamp_age_seconds=self.ONE_HOUR)
+    assert_result(result, "policy", f"ts is {self.ONE_HOUR + 1}s old")
+    assert any(f"policy allows {self.ONE_HOUR}s" in reason for reason in result.failure_reasons)
+    assert result.registrar_binding_verified
+
+  def test_a_longer_age_allowance_does_not_widen_the_tolerance_for_a_ts_from_the_future(self, pki, registrar, issuer_documents):
+    # The reference time is BEFORE the signed ts: the sender's clock is ahead of the receiver's.
+    inside_skew = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX - 300,
+                         max_timestamp_age_seconds=86400)
+    assert_result(inside_skew, "pass")
+    beyond_skew = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX - 301,
+                         max_timestamp_age_seconds=86400)
+    assert_result(beyond_skew, "policy", "ts is 301s in the future")
+
+  def test_an_age_allowance_shorter_than_the_skew_makes_the_receiver_stricter_about_old_messages_only(self, pki, registrar, issuer_documents):
+    stricter = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + 61, max_timestamp_age_seconds=60)
+    assert_result(stricter, "policy", "ts is 61s old")
+    future_within_skew = verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX - 200,
+                                max_timestamp_age_seconds=60)
+    assert_result(future_within_skew, "pass")
+
+  def test_widening_the_skew_alone_widens_both_directions_for_the_no_time_check_option(self, pki, registrar, issuer_documents):
+    # `python -m hw_attest_verify --no-time-check` passes only the skew (999999999); the age allowance then follows it.
+    a_year = 365 * 86400
+    assert_result(verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX + a_year,
+                         max_timestamp_skew_seconds=999_999_999), "pass")
+    assert_result(verify(self.bound(pki, registrar), reference_time=REFERENCE_TIME_UNIX - a_year,
+                         max_timestamp_skew_seconds=999_999_999), "pass")

@@ -9,10 +9,12 @@ Options:
   --auth-results       Output Authentication-Results lines (default: JSON)
   --hostname NAME      Hostname for A-R header (default: mailpal.com)
   --no-time-check      Skip timestamp/expiry checks (for archived emails)
-  --allow-self-signed  Accept self-signed certificates (INSECURE -- testing only)
-  --trust-store PATH   PEM file containing trusted root CAs for chain validation
-                       (the manufacturer-rooted Mode 1 path; Registrar-bound
-                       Mode 1 with aid/bind needs no trust store)
+  --trust-store PATH   PEM file of root certificates. The signer certificate
+                       path to them is checked and printed for information
+                       only: draft -03 names no manufacturer-rooted evidence
+                       profile (EML-07), so it never makes a trust path. A
+                       Mode 1 message needs aid/bind (the Registrar-bound
+                       path) to pass; without them the result is `policy`.
   --trust-hidden-issuer URI
                        Local policy: trust this issuer for hidden-identity
                        Mode 2 (no sub). Repeatable. Without it hidden mode
@@ -119,6 +121,10 @@ def _format_mode1_auth_results_line(
     f" header.typ={_authentication_results_property_value(mode1_result.typ)}"
     f" header.alg={_authentication_results_property_value(mode1_result.alg)}"
   )
+  # Draft -03 "Authentication-Results Integration": path reports which trust path succeeded
+  # (manufacturer, registrar, or both); it is omitted when none did.
+  if mode1_result.trust_path_that_succeeded:
+    line += f" header.path={_authentication_results_property_value(mode1_result.trust_path_that_succeeded)}"
   if mode1_result.trust_tier:
     line += f" header.tier={_authentication_results_property_value(mode1_result.trust_tier)}"
   if mode1_result.agent_identity_urn:
@@ -182,7 +188,6 @@ def _load_trusted_root_certificates_from_pem_file(pem_file_path: str):
 def verify_email_from_raw(
   raw_email: str,
   skip_time_checks: bool = False,
-  allow_self_signed: bool = False,
   trust_store_pem_path: Optional[str] = None,
   allow_eddsa: bool = False,
   trusted_hidden_mode_issuers: Optional[List[str]] = None,
@@ -239,7 +244,6 @@ def verify_email_from_raw(
         email_headers=headers,
         body=body,
         ordered_header_pairs=ordered_header_pairs,
-        allow_self_signed=allow_self_signed,
         trusted_root_certificates=trusted_root_certificates,
         allow_eddsa=allow_eddsa,
         **{k: v for k, v in time_kwargs.items() if k == "max_timestamp_skew_seconds"},
@@ -249,6 +253,13 @@ def verify_email_from_raw(
       "result": mode1_result.authentication_results_result,
       "registrar_binding_verified": mode1_result.registrar_binding_verified,
       "manufacturer_rooted_path_verified": mode1_result.manufacturer_rooted_path_verified,
+      "trust_path_that_succeeded": mode1_result.trust_path_that_succeeded,
+      "cms_signature_and_message_binding_verified": mode1_result.cms_signature_and_message_binding_verified,
+      "registrar_assertion_has_expired": mode1_result.registrar_assertion_has_expired,
+      "aid_is_in_the_registry_test_namespace": mode1_result.aid_is_in_the_registry_test_namespace,
+      "signer_certificate_path_to_supplied_roots_is_valid": mode1_result.signer_certificate_path_to_supplied_roots_is_valid,
+      "signer_certificate_path_to_supplied_roots_failure": mode1_result.signer_certificate_path_to_supplied_roots_failure,
+      "informational_notes": mode1_result.informational_notes,
       "trust_tier": mode1_result.trust_tier,
       "typ": mode1_result.typ,
       "alg": mode1_result.alg,
@@ -294,6 +305,8 @@ def verify_email_from_raw(
       "issued_at_unix": mode2_result.issued_at_unix,
       "expires_at_unix": mode2_result.expires_at_unix,
       "disclosed_claims": mode2_result.disclosed_claims,
+      "token_has_expired": mode2_result.token_has_expired,
+      "disclosed_sub_is_in_the_registry_test_namespace": mode2_result.disclosed_sub_is_in_the_registry_test_namespace,
       "failure_reason": mode2_result.failure_reason,
       "failure_reasons": mode2_result.failure_reasons,
     }
@@ -309,7 +322,6 @@ def main() -> None:
   auth_results_output_mode = False
   auth_results_hostname = "mailpal.com"
   skip_time_checks = False
-  allow_self_signed = False
   allow_eddsa = False
   trust_store_pem_path: Optional[str] = None
   trusted_hidden_mode_issuers: List[str] = []
@@ -324,7 +336,11 @@ def main() -> None:
     elif arg == "--no-time-check":
       skip_time_checks = True
     elif arg == "--allow-self-signed":
-      allow_self_signed = True
+      # Removed in 3.0.0 (email draft -03, EML-01): a self-signed signer certificate with no Registrar binding is a
+      # valid signature with no trust path, which is `policy`. Saying so is better than silently ignoring the option.
+      print("--allow-self-signed was removed in 3.0.0: a self-signed signer certificate never makes a trust path "
+            "(draft -03, EML-01), so there is nothing for the option to allow.", file=sys.stderr)
+      sys.exit(2)
     elif arg == "--allow-eddsa":
       allow_eddsa = True
     elif arg == "--trust-store" and arg_index + 1 < len(sys.argv):
@@ -352,7 +368,6 @@ def main() -> None:
   results = verify_email_from_raw(
     raw_email,
     skip_time_checks=skip_time_checks,
-    allow_self_signed=allow_self_signed,
     trust_store_pem_path=trust_store_pem_path,
     allow_eddsa=allow_eddsa,
     trusted_hidden_mode_issuers=trusted_hidden_mode_issuers,

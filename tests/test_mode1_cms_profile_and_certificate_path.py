@@ -3,9 +3,19 @@ Mode 1 strict CMS profile (AUD-F78), PS256 salt (AUD-F79), certificate path
 building (AUD-F80) and CA rules (AUD-F82).
 
 Self-contained: builds its own PKI, signs real Mode 1 messages over an
-independently computed 72-octet attestation-input, and wraps the signatures
+independently computed 92-octet attestation-input (draft -03: a 20-octet purpose
+label, then the three digests and the time), and wraps the signatures
 in CMS SignedData variants with a small DER encoder, then calls the public
 verify_hardware_attestation(). Clock is fixed (REFERENCE_TIME_UNIX).
+
+What "accepted" means here changed with draft -03. These messages have no aid
+or bind, so no trust path exists for them (EML-01, EML-07): the verifier's
+result for a message whose CMS profile, signature and body hash are all valid
+is `policy`, never `pass`. The strict-profile tests therefore assert that the
+CMS verified (cms_signature_and_message_binding_verified) and that the result
+is exactly that no-trust-path `policy`; the certificate-path tests assert the
+diagnostic result for the supplied roots. The Registrar-bound `pass` path is
+tested in test_mode1_registrar_binding_trust_path.py.
 """
 
 import base64
@@ -249,8 +259,12 @@ def pki():
 
 # --- one Mode 1 message ---------------------------------------------------------
 
-NINE_ALWAYS_COVERED_FIELDS = ["from", "to", "subject", "date", "message-id", "reply-to",
-                              "mime-version", "content-type", "content-transfer-encoding"]
+# Draft -03 header-format, `h`: the thirteen fields every signer MUST list, in the order the draft lists them.
+THIRTEEN_ALWAYS_COVERED_FIELDS = ["from", "to", "cc", "subject", "date", "message-id", "sender", "reply-to",
+                                  "in-reply-to", "references", "mime-version", "content-type",
+                                  "content-transfer-encoding"]
+# Draft -03: "label = "AIRS-Email-Mode1-v1" || 0x00 ; 20 bytes". Written out here, not imported, on purpose.
+MODE1_LABEL = b"AIRS-Email-Mode1-v1" + b"\x00"
 EMAIL_HEADERS = {
   "From": "agent@example.com", "To": "human@example.org", "Subject": "CMS profile test",
   "Date": "Mon, 21 Sep 2026 14:13:20 +0000", "Message-ID": "<cms-profile@example.com>",
@@ -261,21 +275,24 @@ BODY = b"Mode 1 CMS profile test body.\r\n"
 
 def header_value_without_chain(alg: str) -> str:
   bh = base64.urlsafe_b64encode(hashlib.sha256(BODY).digest()).rstrip(b"=").decode()
-  return (f"v=1; typ=SFT; alg={alg}; h={':'.join(NINE_ALWAYS_COVERED_FIELDS)}; "
+  return (f"v=1; typ=SFT; alg={alg}; h={':'.join(THIRTEEN_ALWAYS_COVERED_FIELDS)}; "
           f"bh={bh}; ts={REFERENCE_TIME_UNIX}; chain=")
 
 
-def attestation_input_72_octets(alg: str) -> bytes:
-  """Independent implementation of the draft's attestation-input for simple ASCII headers."""
+def attestation_input_92_octets(alg: str) -> bytes:
+  """Independent implementation of the draft -03 attestation-input for simple ASCII headers:
+  label || h-hash || bh-raw || ts-bytes, exactly 92 octets."""
   lowered = {k.lower(): v for k, v in EMAIL_HEADERS.items()}
-  canonical = "".join(f"{field}:{lowered[field]}\r\n" for field in NINE_ALWAYS_COVERED_FIELDS if field in lowered)
+  canonical = "".join(f"{field}:{lowered[field]}\r\n" for field in THIRTEEN_ALWAYS_COVERED_FIELDS if field in lowered)
   canonical += "hardware-attestation:" + header_value_without_chain(alg).replace(" ", "") + "\r\n"
-  return (hashlib.sha256(canonical.encode()).digest() + hashlib.sha256(BODY).digest()
-          + struct.pack(">Q", REFERENCE_TIME_UNIX))
+  attestation_input = (MODE1_LABEL + hashlib.sha256(canonical.encode()).digest() + hashlib.sha256(BODY).digest()
+                       + struct.pack(">Q", REFERENCE_TIME_UNIX))
+  assert len(attestation_input) == 92
+  return attestation_input
 
 
 def sign_message(alg: str, private_key, salt_length=32) -> bytes:
-  data = attestation_input_72_octets(alg)
+  data = attestation_input_92_octets(alg)
   if alg == "ES256":
     return private_key.sign(data, ec.ECDSA(hashes.SHA256()))
   if alg == "RS256":
@@ -306,12 +323,36 @@ def standard_es256_signed_data(pki, **overrides):
 
 
 def assert_accepted(result):
-  assert result.is_valid, result.failure_reasons
+  """The strict CMS profile, the signature and the body hash all passed, and the signer certificate path to the
+  supplied roots validated. Nothing in these messages is a trust path (no aid/bind, and draft -03 names no
+  manufacturer-rooted profile: EML-01, EML-07), so the final result is exactly the no-trust-path `policy`."""
+  assert result.cms_signature_and_message_binding_verified, result.failure_reasons
+  assert result.signer_certificate_path_to_supplied_roots_is_valid is True, (
+    result.signer_certificate_path_to_supplied_roots_failure)
+  assert result.authentication_results_result == "policy" and not result.is_valid, (
+    result.authentication_results_result, result.failure_reasons)
+  assert any("no trust path was established" in reason for reason in result.failure_reasons), result.failure_reasons
+  assert result.trust_path_that_succeeded == "" and result.manufacturer_rooted_path_verified is None
 
 
 def assert_rejected_with(result, expected_reason_fragment: str):
+  """Rejected by the CMS profile, the signature or the body hash: a failure (fail or permerror), with the reason."""
   assert not result.is_valid
+  assert result.authentication_results_result in ("fail", "permerror"), result.authentication_results_result
+  assert not result.cms_signature_and_message_binding_verified
   assert any(expected_reason_fragment in reason for reason in result.failure_reasons), result.failure_reasons
+
+
+def assert_path_rejected_with(result, expected_reason_fragment: str):
+  """The CMS itself verified but the signer certificate path to the supplied roots did not validate. Under draft -03
+  that path is diagnostic only (EML-07), so it is reported in its own field and the result is the same no-trust-path
+  `policy` as for a valid path: a bad path to a local root neither fails the message nor makes a trust path."""
+  assert result.cms_signature_and_message_binding_verified, result.failure_reasons
+  assert result.signer_certificate_path_to_supplied_roots_is_valid is False
+  assert expected_reason_fragment in result.signer_certificate_path_to_supplied_roots_failure, (
+    result.signer_certificate_path_to_supplied_roots_failure)
+  assert result.authentication_results_result == "policy" and not result.is_valid
+  assert result.trust_path_that_succeeded == "" and result.manufacturer_rooted_path_verified is None
 
 
 # --- AUD-F78: strict CMS profile ---------------------------------------------------
@@ -488,12 +529,11 @@ class TestCertificatePathBuildingAudF80:
 
   def test_missing_intermediate_names_the_missing_issuer(self, pki):
     result = verify_message("ES256", standard_es256_signed_data(pki, certificates_in_set_order=[pki.ec_leaf]), [pki.root])
-    assert_rejected_with(result, "is named as the issuer 'CN=Intermediate,O=Test'")
+    assert_path_rejected_with(result, "is named as the issuer 'CN=Intermediate,O=Test'")
 
   def test_untrusted_root_is_rejected(self, pki):
     result = verify_message("ES256", standard_es256_signed_data(pki), [pki.unrelated_root])
-    assert not result.is_valid
-    assert any("Certificate chain validation failed" in reason for reason in result.failure_reasons)
+    assert_path_rejected_with(result, "no certificate in SignedData or the trust store is named as the issuer 'CN=Root,O=Test'")
 
   def test_signer_key_pinned_as_trust_anchor_is_accepted(self, pki):
     assert_accepted(verify_message("ES256", standard_es256_signed_data(
@@ -521,13 +561,13 @@ class TestCertificatePathCaRulesAudF82:
     bad_intermediate = pki.intermediate_variant(**intermediate_overrides)
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[pki.ec_leaf, bad_intermediate, pki.root]), [pki.root])
-    assert_rejected_with(result, expected_reason_fragment)
+    assert_path_rejected_with(result, expected_reason_fragment)
 
   def test_path_length_constraint_of_the_trust_anchor_is_honoured(self, pki):
     root_with_path_length_zero = issue_certificate("Root", pki.root_key, "Root", pki.root_key, ca_basic_constraints(0))
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[pki.ec_leaf, pki.intermediate]), [root_with_path_length_zero])
-    assert_rejected_with(result, "has pathLenConstraint 0 but 1 intermediate certificate(s) follow it")
+    assert_path_rejected_with(result, "has pathLenConstraint 0 but 1 intermediate certificate(s) follow it")
 
   def test_bundled_look_alike_root_cannot_drop_the_trust_store_constraints(self, pki):
     root_with_path_length_zero = issue_certificate("Root", pki.root_key, "Root", pki.root_key, ca_basic_constraints(0))
@@ -535,7 +575,7 @@ class TestCertificatePathCaRulesAudF82:
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[pki.ec_leaf, pki.intermediate, look_alike_root_without_path_length]),
       [root_with_path_length_zero])
-    assert_rejected_with(result, "has pathLenConstraint 0")
+    assert_path_rejected_with(result, "has pathLenConstraint 0")
 
   def test_path_length_constraint_of_an_intermediate_is_honoured(self, pki):
     second_level_key = ec.generate_private_key(ec.SECP256R1())
@@ -544,7 +584,7 @@ class TestCertificatePathCaRulesAudF82:
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[leaf_under_second_level, second_level_intermediate, pki.intermediate],
       sid_certificate=leaf_under_second_level), [pki.root])
-    assert_rejected_with(result, "'CN=Intermediate,O=Test' has pathLenConstraint 0 but 1 intermediate")
+    assert_path_rejected_with(result, "'CN=Intermediate,O=Test' has pathLenConstraint 0 but 1 intermediate")
 
   def test_self_issued_intermediate_does_not_count_towards_path_length(self, pki):
     rollover_key = ec.generate_private_key(ec.SECP256R1())
@@ -559,7 +599,7 @@ class TestCertificatePathCaRulesAudF82:
     expired_root = issue_certificate("Root", pki.root_key, "Root", pki.root_key, ca_basic_constraints(1),
                                      not_after=REFERENCE_TIME_UTC - datetime.timedelta(days=1))
     result = verify_message("ES256", standard_es256_signed_data(pki, certificates_in_set_order=[pki.ec_leaf, pki.intermediate]), [expired_root])
-    assert_rejected_with(result, "'CN=Root,O=Test' has expired")
+    assert_path_rejected_with(result, "'CN=Root,O=Test' has expired")
 
   def test_version_1_trust_anchor_without_extensions_is_accepted(self, pki):
     version_1_root = build_version_1_certificate("Root", pki.root_key, "Root", pki.root_key)
@@ -571,14 +611,14 @@ class TestCertificatePathCaRulesAudF82:
     version_1_intermediate = build_version_1_certificate("Intermediate", pki.intermediate_key, "Root", pki.root_key)
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[pki.ec_leaf, version_1_intermediate]), [pki.root])
-    assert_rejected_with(result, "has no basicConstraints extension, so it is not a CA")
+    assert_path_rejected_with(result, "has no basicConstraints extension, so it is not a CA")
 
   def test_signer_without_digital_signature_key_usage_is_rejected(self, pki):
     leaf_for_key_agreement_only = pki.issue_leaf("EC Leaf", pki.ec_leaf_key, key_usage="key_agreement_only")
     result = verify_message("ES256", standard_es256_signed_data(
       pki, certificates_in_set_order=[leaf_for_key_agreement_only, pki.intermediate],
       sid_certificate=leaf_for_key_agreement_only), [pki.root])
-    assert_rejected_with(result, "lacks digitalSignature keyUsage")
+    assert_path_rejected_with(result, "lacks digitalSignature keyUsage")
 
   def test_critical_subject_alternative_name_on_the_signer_is_recognised(self, pki):
     leaf_with_critical_san = pki.issue_leaf("EC Leaf", pki.ec_leaf_key, extra_extensions=[
@@ -628,7 +668,7 @@ class TestStrictDerDecoding:
 
   def test_non_minimal_definite_length_is_legal_ber_and_decodes(self, pki):
     # OWN-024 (Chris 2026-09-24): RFC 5652 CMS is BER, so a non-minimal
-    # definite length is accepted; only the 72-octet input is signed.
+    # definite length is accepted; only the 92-octet input is signed.
     der = self.valid_signed_data(pki)
     assert der[1] == 0x82
     non_minimal = der[:1] + b"\x84" + len(der[4:]).to_bytes(4, "big") + der[4:]

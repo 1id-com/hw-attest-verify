@@ -31,8 +31,8 @@ REAL_EXAMPLES = {
 
 
 def passing_mode1(aid="urn:aid:global:id-a", tier="sovereign", thumbprint="T1", covers_mode2=True) -> VerificationResult:
-  names = ["from", "to", "subject", "date", "message-id", "reply-to", "mime-version", "content-type",
-           "content-transfer-encoding"] + (["hardware-trust-proof"] if covers_mode2 else [])
+  names = ["from", "to", "cc", "subject", "date", "message-id", "sender", "reply-to", "in-reply-to", "references",
+           "mime-version", "content-type", "content-transfer-encoding"] + (["hardware-trust-proof"] if covers_mode2 else [])
   return VerificationResult(is_valid=True, authentication_results_result="pass", agent_identity_urn=aid,
                             trust_tier=tier, signed_header_names=names, signer_public_key_jwk_thumbprint=thumbprint)
 
@@ -101,7 +101,43 @@ def read_example(file_name: str) -> str:
     return example_file.read()
 
 
+# The five captures below were made on 2026-09-24 under revision -02 of the email draft: their Mode 1 `h` lists nine
+# fields and their signed input is 72 octets with no label. Revision -03 requires thirteen fields and 92 octets
+# (EML-11, EML-12), so a -03 verifier correctly rejects them (see TestRevision02CapturesAreRejectedUnderRevision03).
+# That is a property of the old files, not a defect to be hidden: the author decided (2026-10-26) that new example
+# emails are to be generated through the live system once the -03 implementation is deployed, and then replace these.
+# Until then the tests that need a PASSING real capture are marked strict-xfail, so they are still run, still visible
+# in every report as "xfailed", and turn into a hard failure as soon as they start passing (which means the captures
+# were replaced and this marker must be removed). Plan ledger: "regenerate examples from the live system".
+NEEDS_A_PASSING_REVISION_03_CAPTURE = pytest.mark.xfail(
+  strict=True, raises=AssertionError,
+  reason="historical revision -02 capture (2026-09-24): replaced by a capture made through the live system "
+         "after the revision -03 deployment",
+)
+
+
+class TestRevision02CapturesAreRejectedUnderRevision03:
+  @pytest.mark.parametrize("file_name", sorted(REAL_EXAMPLES))
+  def test_mode_1_of_a_revision_02_capture_is_permerror_naming_the_missing_fields(self, recorded_live_answers, file_name):
+    results = verify_email_from_raw(read_example(file_name), skip_time_checks=True)
+    mode1_result = results["_mode1_result_object"]
+    assert mode1_result.authentication_results_result == "permerror"
+    assert any("h= tag missing required headers: cc, in-reply-to, references, sender" in reason
+               for reason in mode1_result.failure_reasons), mode1_result.failure_reasons
+    assert not mode1_result.is_valid and mode1_result.trust_tier == "" and mode1_result.agent_identity_urn is None
+
+  @pytest.mark.parametrize("file_name", sorted(REAL_EXAMPLES))
+  def test_the_cnf_bearing_mode_2_of_a_revision_02_capture_does_not_pass_without_its_mode_1(self, recorded_live_answers, file_name):
+    # Mode 2's own nonce is unchanged by -03 when none of the four added fields is present, so the SD-JWT itself still
+    # verifies; but it carries cnf (Combined mode), so it depends on a Mode 1 that no longer verifies and must not pass.
+    results = verify_email_from_raw(read_example(file_name), skip_time_checks=True)
+    mode2_result = results["_mode2_result_object"]
+    assert mode2_result.authentication_results_result == "fail"
+    assert any("Combined mode" in problem for problem in results["combined_mode_errors"])
+
+
 class TestRealExampleEmails:
+  @NEEDS_A_PASSING_REVISION_03_CAPTURE
   @pytest.mark.parametrize("file_name", sorted(REAL_EXAMPLES))
   def test_real_example_passes_both_modes_without_a_trust_store(self, recorded_live_answers, file_name):
     expected_typ, expected_tier, expected_aid = REAL_EXAMPLES[file_name]
@@ -116,6 +152,7 @@ class TestRealExampleEmails:
     assert mode2_result.cnf_jwk_thumbprint == mode1_result.signer_public_key_jwk_thumbprint
     assert "combined_mode_errors" not in results
 
+  @NEEDS_A_PASSING_REVISION_03_CAPTURE
   def test_lf_only_copy_as_printed_in_the_draft_appendix_still_verifies(self, recorded_live_answers):
     lf_only_copy = read_example("example_2_portable_piv_combined.eml").replace("\r\n", "\n")
     results = verify_email_from_raw(lf_only_copy, skip_time_checks=True)
@@ -123,8 +160,10 @@ class TestRealExampleEmails:
     assert results["_mode2_result_object"].authentication_results_result == "pass"
 
   def test_real_example_is_expired_when_checked_as_current(self, recorded_live_answers):
+    # Draft -03 (EML-02): an expired SD-JWT is `policy` with the cause in the comment, not `fail` (it was `fail` in -02).
+    # The capture's SD-JWT still verifies under -03 (its nonce is unchanged: none of the four added fields is present).
     results = verify_email_from_raw(read_example("example_5_declared_software_combined.eml"))
-    assert results["_mode2_result_object"].authentication_results_result == "fail"
+    assert results["_mode2_result_object"].authentication_results_result == "policy"
     assert "expired" in results["_mode2_result_object"].failure_reason
 
   def test_removing_hardware_attestation_fails_the_cnf_bearing_mode2(self, recorded_live_answers):
@@ -136,6 +175,7 @@ class TestRealExampleEmails:
     assert results["_mode2_result_object"].authentication_results_result == "fail"
     assert "no Hardware-Attestation field" in results["_mode2_result_object"].failure_reason
 
+  @NEEDS_A_PASSING_REVISION_03_CAPTURE
   def test_withholding_the_sub_disclosure_breaks_both_proofs(self, recorded_live_answers):
     raw = read_example("example_5_declared_software_combined.eml")
     field_match = re.search(r"(?im)^Hardware-Trust-Proof:(.*(?:\r?\n[ \t].*)*)", raw)

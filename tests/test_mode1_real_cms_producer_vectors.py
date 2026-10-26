@@ -15,6 +15,16 @@ Six BouncyCastle 1.78.1 (Java) vectors were appended locally on 2026-09-24 by
 the same script with --bouncycastle-jars: CMSSignedData.getEncoded() default
 (BER with indefinite lengths) and getEncoded("DER"). RFC 5652 CMS is BER, so
 both verify (OWN-024, Chris 2026-09-24: accept BER).
+
+Regenerated on 2026-10-26 for email draft -03 (92-octet attestation-input,
+thirteen always-covered fields) with the same script: OpenSSL 3.2.1, the Python
+and Node SDK builders as of this commit, and BouncyCastle 1.78.1 (jars checked
+against the Maven Central SHA-1 files). Under -03 a producer vector has no
+Registrar binding, so what each vector asserts is that the CMS signature, the
+body hash and the structure verify (cms_signature_and_message_binding_verified)
+and that the outcome is `policy`, never `pass` (EML-01); the one negative vector
+(OpenSSL PSS with a 20-octet salt) violates the Version 1 CMS profile and is
+`permerror`.
 """
 
 import base64
@@ -40,7 +50,23 @@ def test_real_producer_vector_verifies_as_the_draft_requires(vector):
     trusted_root_certificates=[x509.load_pem_x509_certificate(vector["trusted_root_pem"].encode())],
     reference_time_unix=vector["reference_time_unix"],
   )
-  assert result.is_valid == vector["expected_valid"], result.failure_reasons
+  expected = vector["expected_cms_signature_and_message_binding_verified"]
+  assert result.cms_signature_and_message_binding_verified == expected, result.failure_reasons
+  if expected:
+    # EML-01: the CMS is correct, but a producer interop vector carries no aid/bind (no Registrar binding), and a
+    # certificate path to the supplied root is diagnostic only (EML-07), so nothing established a trust path:
+    # `policy`, never `pass`.
+    assert result.authentication_results_result == "policy", result.failure_reasons
+    assert result.trust_path_that_succeeded == ""
+    # AUD-F80/F82 still hold, as a diagnostic: the certificate set the producer wrote builds a path to the supplied
+    # root, whatever order the producer wrote the certificates in.
+    assert result.signer_certificate_path_to_supplied_roots_is_valid is True, (
+      result.signer_certificate_path_to_supplied_roots_failure
+    )
+  else:
+    # The only negative vector is OpenSSL's PSS signature with a 20-octet salt: the Version 1 CMS profile requires a
+    # 32-octet salt for PS256, so the structure does not conform to the profile (a permanent, structural error).
+    assert result.authentication_results_result == "permerror", result.failure_reasons
 
 
 def test_vectors_cover_every_producer_and_algorithm():
@@ -49,4 +75,4 @@ def test_vectors_cover_every_producer_and_algorithm():
     "bouncycastle-default-ber", "bouncycastle-der"}
   assert any(vector["header_value"].split("chain=")[1].startswith("MIA") for vector in _VECTORS)  # BER: 30 80 ...
   assert {vector["alg"] for vector in _VECTORS} == {"ES256", "RS256", "PS256"}
-  assert any(not vector["expected_valid"] for vector in _VECTORS)  # the PSS salt-20 negative
+  assert any(not vector["expected_cms_signature_and_message_binding_verified"] for vector in _VECTORS)  # the PSS salt-20 negative

@@ -4,7 +4,7 @@ Strict decoder for the Version 1 Mode 1 CMS SignedData profile.
 Email draft (draft-drake-email-hardware-attestation), Hardware-Attestation
 `chain` + "CMS Algorithm Mapping":
 - ContentInfo(id-signedData) holding SignedData with encapContentInfo present,
-  eContentType id-data and eContent omitted (detached 72-octet input);
+  eContentType id-data and eContent omitted (detached 92-octet input);
 - exactly one SignerInfo, signedAttrs absent;
 - SignedData digestAlgorithms and SignerInfo digestAlgorithm identify SHA-256;
 - SignerInfo signatureAlgorithm + parameters match the header `alg`, and the
@@ -14,7 +14,7 @@ Email draft (draft-drake-email-hardware-attestation), Hardware-Attestation
 Every deviation raises Mode1CmsProfileViolation: the decoder fails closed
 (AUD-F78). Encoding: BER as RFC 5652 permits -- definite lengths (minimal or
 not) and indefinite lengths on constructed encodings, as BouncyCastle emits
-by default (OWN-024, Chris 2026-09-24); no trailing bytes. Only the 72-octet
+by default (OWN-024, Chris 2026-09-24); no trailing bytes. Only the 92-octet
 attestation-input is signed, so the container encoding carries no security
 meaning. Certificates are loaded exactly as encoded (DER, as X.509 requires).
 """

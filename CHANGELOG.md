@@ -1,5 +1,100 @@
 # Changelog
 
+## 3.0.0 (2026-10-26)
+
+Implements revision -03 of `draft-drake-email-hardware-attestation` (amendments
+EML-01 to EML-13). **Breaking**: a -03 verifier does not accept -02 proofs (the
+signed input and the covered fields changed) and the meaning of `pass` is
+stricter. This is the "initial development" stage: there is no compatibility
+mode, and the real appendix captures of revision -02 are recorded as expected
+failures until they are replaced by captures made through the live system.
+
+### Mode 1: the signed input and the covered fields
+
+- **92-octet attestation-input with a purpose label (EML-12)**:
+  `"AIRS-Email-Mode1-v1" || 0x00 || h-hash || bh-raw || ts` (was 72 octets with
+  no label). The detached CMS signature is over exactly those 92 octets.
+  `MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET`
+  in `parse.py`; the helper `_compute_attestation_input` returns the 92 octets.
+- **Thirteen always-covered fields (EML-11)**: `h=` must list From, To, Cc,
+  Subject, Date, Message-ID, Sender, Reply-To, In-Reply-To, References,
+  MIME-Version, Content-Type and Content-Transfer-Encoding (was nine), whether or
+  not each is present; Mode 2's message-binding nonce covers the same thirteen
+  (`ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER`). Duplicates of the four added
+  fields are rejected like the original singletons.
+- **Hardware-Trust-Proof canonicalization (EML-10)**: when `h=` names
+  `Hardware-Trust-Proof` its value is canonicalized with every whitespace
+  character deleted, so a legal refolding of the SD-JWT in transit does not break
+  the Mode 1 signature.
+- **`ts` grammar (EML-03)**: `0` or a decimal without leading zeroes, at most
+  18446744073709551615; anything else is `permerror`. `v` must be exactly `1`
+  without leading zeroes.
+- **Header size limit**: a field over `maximum_header_field_value_octets`
+  (default 65536) is `permerror` before any decoding.
+
+### Results
+
+- **`pass` needs a trust path (EML-01)**: `pass` only if at least one trust path
+  succeeded and every path evaluated succeeded. A valid CMS signature with no
+  verified Registrar binding is `policy` (reason in `failure_reasons`). New result
+  fields: `trust_path_that_succeeded` (`"registrar"` or `""`),
+  `cms_signature_and_message_binding_verified`.
+- **The manufacturer-rooted path is reserved (EML-07)**: no evidence profile is
+  named, so none is reported (`manufacturer_rooted_path_verified` stays `None`).
+  `trusted_root_certificates` / `--trust-store` still validate the signer's
+  certificate path to the supplied roots, but only as information
+  (`signer_certificate_path_to_supplied_roots_is_valid` and `..._failure`).
+- **Expiry is `policy` (EML-02)**: an expired Registrar binding assertion
+  (`registrar_assertion_has_expired`) or an expired SD-JWT (`token_has_expired`)
+  is `policy` with the cause in the reason; a forged expired assertion is still
+  `fail`. A non-numeric or non-finite `iat` / `exp` fails closed.
+- **The Registry test namespace is `policy` (EML-13)**: a `urn:aid:test:` identity
+  is reported as `policy`, with no tier and no `aid` property
+  (`aid_is_in_the_registry_test_namespace`,
+  `disclosed_sub_is_in_the_registry_test_namespace`); its binding or SD-JWT is
+  fully verified first, so forgery is still a failure.
+- **The binding's `aid` object is required (EML-05)**: a Registrar binding
+  without the `aid` claim object, or whose `trust_tier` does not correspond to
+  `typ`, fails.
+- **Authentication-Results**: `header.path=registrar` is written when a trust
+  path succeeded; `header.tier` and `header.aid` only with a verified binding.
+
+### Added
+
+- `max_timestamp_age_seconds` (parameter of `verify_hardware_attestation`): the local freshness policy for how OLD
+  `ts` may be, separate from `max_timestamp_skew_seconds` (the clock-skew allowance for a `ts` or binding `iat` in the
+  future). The default is the skew value, so the strict policy of an MSA, and every existing call, is unchanged. A
+  receiver that verifies after queueing and greylisting sets it to the lifetime of the Registrar's mail assertions
+  without also accepting a `ts` from the future. A stale `ts` is `policy`, as before; the reason now says "old" or
+  "in the future" (it said "from the reference time").
+
+### Removed
+
+- `allow_self_signed` (parameter of `verify_hardware_attestation` and
+  `verify_email_from_raw`) and the CLI option `--allow-self-signed`: a
+  self-signed signer certificate has no trust path of its own. The CLI option now
+  prints an explanation and exits with status 2.
+
+### Tests
+
+- `tests/test_revision_03_combined_mode_end_to_end.py`: complete Combined-mode
+  messages built from the draft's text alone (an independent producer), covering
+  all thirteen fields, the two Hardware-* fields folded and refolded, expiry,
+  the test namespace, and a known-answer vector for the 92-octet input computed
+  with coreutils only (`tests/fixtures/known_answer_mode1_attestation_input`).
+- The revision -02 appendix captures in
+  `tests/fixtures/real_examples_2026_09_24` are rejected (a test says so, naming
+  the missing fields) and the tests that need a passing capture are strict
+  expected failures until live captures replace them.
+- `tests/fixtures/mode1_real_cms_producer_vectors.json` was regenerated for -03
+  (22 vectors: the Python and Node SDK builders, OpenSSL with three signer
+  identifier and certificate-order variants, BouncyCastle in BER and DER). Each
+  asserts that the CMS signature, the body hash and the structure verify and
+  that the result is `policy` (a producer vector has no Registrar binding, so
+  nothing established a trust path, EML-01); the one negative vector (a PSS
+  signature with a 20-octet salt) is `permerror`. The path to the supplied root
+  is checked as a diagnostic for every positive vector.
+
 ## 2.0.2 (2026-09-25)
 
 Fixes from the external pre-submission review (rfc/072).

@@ -13,12 +13,20 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 
-# Email draft: both modes always cover these nine fields, in this order for
-# Mode 2 (a listed field that is absent protects against its later addition).
+# Email draft -03 (EML-11), "Header Field and CMS Profile", `h`: both modes always cover these thirteen fields,
+# in this order for Mode 2 (a listed field that is absent protects against its later addition, and an absent
+# field adds no bytes to a hash). -02 covered nine; Cc, Sender, In-Reply-To and References were added because they
+# change who a message appears to be from and to, and which conversation it appears to belong to.
 ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER = [
-  "from", "to", "subject", "date", "message-id",
-  "reply-to", "mime-version", "content-type", "content-transfer-encoding",
+  "from", "to", "cc", "subject", "date", "message-id", "sender",
+  "reply-to", "in-reply-to", "references",
+  "mime-version", "content-type", "content-transfer-encoding",
 ]
+# Email draft -03 (EML-12): the Mode 1 attestation-input begins with this 20-octet purpose label, the ASCII text
+# "AIRS-Email-Mode1-v1" (19 octets) followed by one zero octet. The label is reserved for Mode 1: a signer that signs
+# data supplied by another party with a Mode 1 proof key MUST refuse data that begins with it.
+MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET = b"AIRS-Email-Mode1-v1\x00"
+assert len(MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET) == 20
 # Fields that must occur at most once for verification to be meaningful.
 SINGLETON_HEADER_FIELD_NAMES_FOR_VERIFICATION = set(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER) | {
   "hardware-attestation", "hardware-trust-proof",
@@ -68,6 +76,9 @@ _EXTENSION_TAG_NAME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 _MODE1_TAG_NAMES_IN_ABNF_ORDER = ["v", "typ", "alg", "h", "bh", "ts", "chain", "aid", "bind"]
 _AID_URN_CHARACTERS_AFTER_FWS_REMOVAL_PATTERN = re.compile(r"^[A-Za-z0-9:-]+$")
 _BASE64URL_WITHOUT_PADDING_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+# Email draft -03 ABNF: ts-value = "0" / (%x31-39 *19DIGIT)
+_TS_VALUE_WITHOUT_LEADING_ZEROS_PATTERN = re.compile(r"0|[1-9][0-9]{0,19}")
+_LARGEST_UNSIGNED_64_BIT_TS_VALUE = 18446744073709551615
 _COMPACT_JWS_WITHOUT_TRANSPORT_FWS_PATTERN = re.compile(
   r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$"
 )
@@ -178,6 +189,9 @@ def parse_hardware_attestation_header(header_value: str) -> ParsedHardwareAttest
   if "v" in raw_parameters:
     if not re.fullmatch(r"[0-9]+", raw_parameters["v"]):
       parse_errors.append("v parameter must contain decimal digits without embedded WSP")
+    elif raw_parameters["v"] != str(int(raw_parameters["v"])):
+      # Email draft -03 grammar: hw-version is the literal "1"; "01" is not version 1.
+      parse_errors.append("v parameter must be written without leading zeroes (the only version is exactly 1)")
     else:
       result.version = int(raw_parameters["v"])
 
@@ -215,8 +229,12 @@ def parse_hardware_attestation_header(header_value: str) -> ParsedHardwareAttest
 
   if "ts" in raw_parameters:
     ts_without_fws = _remove_transport_fws_from_encoded_value(raw_parameters["ts"])
-    if not re.fullmatch(r"[0-9]+", ts_without_fws):
-      parse_errors.append("ts parameter must contain decimal digits after FWS removal")
+    # Email draft -03 (EML-14) grammar: ts-value = "0" / (%x31-39 *19DIGIT) -- no leading zeros, at most 20 digits --
+    # and "A ts value greater than 18446744073709551615 is malformed (permerror)" because ts-bytes is a uint64.
+    if not _TS_VALUE_WITHOUT_LEADING_ZEROS_PATTERN.fullmatch(ts_without_fws):
+      parse_errors.append("ts parameter must be unsigned decimal digits without leading zeroes after FWS removal")
+    elif int(ts_without_fws) > _LARGEST_UNSIGNED_64_BIT_TS_VALUE:
+      parse_errors.append("ts parameter is greater than 18446744073709551615 (it must fit the uint64 ts-bytes)")
     else:
       result.ts = int(ts_without_fws)
 

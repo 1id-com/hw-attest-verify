@@ -3,6 +3,7 @@
 import pytest
 from hw_attest_verify.parse import (
   ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER,
+  MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET,
   find_duplicate_singleton_header_field_names,
   parse_hardware_attestation_header,
   replace_single_chain_tag_value_with_empty_value_preserving_other_text,
@@ -140,12 +141,64 @@ def test_chain_is_emptied_without_reordering_or_dropping_extension_tags():
   )
 
 
-# Email draft (2026-09-24): both modes always cover these nine fields, in this order.
-def test_always_covered_header_fields_are_the_nine_in_spec_order():
+# Email draft -03 (EML-11), header-format `h`: both modes always cover these thirteen fields, in this order.
+def test_always_covered_header_fields_are_the_thirteen_in_spec_order():
   assert list(ALWAYS_COVERED_HEADER_FIELD_NAMES_IN_ORDER) == [
-    "from", "to", "subject", "date", "message-id",
-    "reply-to", "mime-version", "content-type", "content-transfer-encoding",
+    "from", "to", "cc", "subject", "date", "message-id", "sender",
+    "reply-to", "in-reply-to", "references",
+    "mime-version", "content-type", "content-transfer-encoding",
   ]
+
+
+def test_the_mode_1_purpose_label_is_the_twenty_octet_text_and_a_zero_octet_eml12():
+  assert MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET == b"AIRS-Email-Mode1-v1\x00"
+  assert len(MODE1_ATTESTATION_INPUT_PURPOSE_LABEL_INCLUDING_THE_TERMINATING_ZERO_OCTET) == 20
+
+
+@pytest.mark.parametrize("duplicated_field", ["cc", "sender", "in-reply-to", "references"])
+def test_each_field_added_in_03_is_a_duplicate_checked_singleton(duplicated_field):
+  ordered_header_pairs = [(duplicated_field, "a"), (duplicated_field.title(), "b")]
+  assert find_duplicate_singleton_header_field_names(ordered_header_pairs) == [duplicated_field]
+
+
+# Email draft -03 ABNF: ts-value = "0" / (%x31-39 *19DIGIT) -- no leading zeros -- and "A ts value greater than
+# 18446744073709551615 is malformed (permerror)". v is "exactly 1".
+_REST_OF_A_WELL_FORMED_FIELD = "; typ=TPM; alg=RS256; h=from:to; bh=abc123; ts={ts}; chain=QUJD"
+
+
+@pytest.mark.parametrize("ts_text", ["0", "1", "1710849600", "18446744073709551615"])
+def test_ts_values_the_grammar_allows_are_accepted(ts_text):
+  parsed = parse_hardware_attestation_header("v=1" + _REST_OF_A_WELL_FORMED_FIELD.format(ts=ts_text))
+  assert parsed.parse_errors == []
+  assert parsed.ts == int(ts_text)
+
+
+@pytest.mark.parametrize("ts_text, expected_error_fragment", [
+  ("01", "without leading zeroes"),
+  ("00", "without leading zeroes"),
+  ("0001710849600", "without leading zeroes"),
+  ("18446744073709551616", "greater than 18446744073709551615"),
+  ("99999999999999999999", "greater than 18446744073709551615"),
+  ("123456789012345678901", "without leading zeroes"),  # 21 digits: not even the ABNF shape
+  ("-1", "without leading zeroes"),
+  ("+1", "without leading zeroes"),
+  ("1e3", "without leading zeroes"),
+  ("1.5", "without leading zeroes"),
+])
+def test_ts_values_the_grammar_forbids_make_the_field_malformed(ts_text, expected_error_fragment):
+  parsed = parse_hardware_attestation_header("v=1" + _REST_OF_A_WELL_FORMED_FIELD.format(ts=ts_text))
+  assert any(expected_error_fragment in error for error in parsed.parse_errors), parsed.parse_errors
+
+
+def test_a_ts_that_only_looks_valid_after_removing_folding_whitespace_is_still_checked():
+  parsed = parse_hardware_attestation_header("v=1" + _REST_OF_A_WELL_FORMED_FIELD.format(ts="01\r\n 710849600"))
+  assert any("without leading zeroes" in error for error in parsed.parse_errors), parsed.parse_errors
+
+
+@pytest.mark.parametrize("v_text", ["01", "2", "0", "1.0", "+1", "one", ""])
+def test_v_other_than_exactly_1_is_not_accepted(v_text):
+  parsed = parse_hardware_attestation_header(f"v={v_text}" + _REST_OF_A_WELL_FORMED_FIELD.format(ts="1"))
+  assert parsed.version != 1 or parsed.parse_errors, (parsed.version, parsed.parse_errors)
 
 
 def test_each_duplicated_always_covered_or_attestation_field_is_reported_case_insensitively():

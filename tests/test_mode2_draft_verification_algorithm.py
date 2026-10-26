@@ -209,8 +209,27 @@ class TestTimeRulesAudF49:
     result = verify(presentation(payload_overrides={"exp": None}), reference_time=NOW + 3600)
     assert_result(result, "policy", "local age policy")
 
-  def test_expired_proof_fails(self):
-    assert_result(verify(presentation(), reference_time=NOW + 3600), "fail", "expired")
+  def test_expired_proof_is_policy_with_the_cause_eml02(self):
+    # Draft -03, Mode 2 verification step 4: "delivery delay does not make an expired JWT valid. An expired token is
+    # reported as policy, with the cause in the comment." (It was `fail` in -02.)
+    result = verify(presentation(), reference_time=NOW + 3600)
+    assert_result(result, "policy", "expired")
+    assert result.token_has_expired
+
+  def test_expiry_is_the_only_reason_when_the_proof_is_not_old(self):
+    # exp = NOW + 300; checked at NOW + 3600 with a generous local age allowance.
+    result = verify(presentation(), reference_time=NOW + 3600, max_proof_age_seconds=10_000)
+    assert_result(result, "policy", "expired")
+    assert len(result.failure_reasons) == 1
+
+  def test_forged_expired_proof_is_still_a_failure(self):
+    result = verify(presentation(signing_key=ec.generate_private_key(ec.SECP256R1())), reference_time=NOW + 3600)
+    assert_result(result, "fail", "Signature")
+    assert not result.token_has_expired
+
+  def test_expired_proof_with_a_wrong_nonce_is_still_a_failure(self):
+    result = verify(presentation(payload_overrides={"nonce": "not-the-message-binding-nonce"}), reference_time=NOW + 3600)
+    assert_result(result, "fail", "nonce mismatch")
 
   def test_materially_future_iat_fails(self):
     assert_result(verify(presentation(), reference_time=NOW - 3600), "fail", "future")
@@ -270,3 +289,77 @@ class TestRfc8414KeyDiscovery:
     assert issuer_key_discovery.build_rfc8414_metadata_url_for_issuer("https://1id.com/realms/agents") == \
       "https://1id.com/.well-known/oauth-authorization-server/realms/agents"
     assert issuer_key_discovery.build_rfc8414_metadata_url_for_issuer("http://1id.com/realms/agents") is None
+
+
+class TestTestNamespaceIdentityIsPolicyEml13:
+  """Draft -03 `agent-identity-format`: an aid in the Registry's test namespace carries no production assurance; a
+  verifier applying production policy MUST report policy and MUST NOT report a tier or aid property for it."""
+
+  TEST_AID = "urn:aid:test:id-qkckh-xxtcw-cxbvp-gpskg"
+
+  def test_disclosed_test_namespace_sub_is_policy_with_no_tier_and_no_aid(self):
+    test_sub_disclosure = disclosure("salt-sub", "sub", self.TEST_AID)
+    result = verify(presentation(disclosures=(AID_DISCLOSURE, test_sub_disclosure)))
+    assert_result(result, "policy", "test namespace")
+    assert result.disclosed_sub_is_in_the_registry_test_namespace
+    assert result.trust_tier == "" and result.agent_identity_urn == ""
+
+  def test_forged_test_namespace_presentation_is_still_a_failure(self):
+    test_sub_disclosure = disclosure("salt-sub", "sub", self.TEST_AID)
+    result = verify(presentation(disclosures=(AID_DISCLOSURE, test_sub_disclosure),
+                                 signing_key=ec.generate_private_key(ec.SECP256R1())))
+    assert_result(result, "fail", "Signature")
+
+  def test_a_production_sub_is_unaffected(self):
+    result = verify(presentation())
+    assert_result(result, "pass")
+    assert not result.disclosed_sub_is_in_the_registry_test_namespace
+    assert result.trust_tier == "sovereign" and result.agent_identity_urn == AID
+
+
+class TestMessageBindingNonceCoversTheThirteenFieldsEml11:
+  """The nonce is recomputed here from the draft's text alone (not with the library's function): h-hash over the
+  thirteen always-covered fields in the draft's order with DKIM relaxed canonicalization, then the exact ASCII string
+  "hardware-trust-proof:" with no CRLF; bh-raw over the simple-canonicalized body; ts-bytes = big-endian uint64(iat)."""
+
+  ALL_THIRTEEN_FIELDS = {
+    "from": "agent@example.com", "to": "human@example.org", "cc": "copy@example.org", "subject": "Mode 2 test",
+    "date": "Mon, 21 Sep 2026 14:13:20 +0000", "message-id": "<mode2@example.com>", "sender": "bot@example.com",
+    "reply-to": "replies@example.com", "in-reply-to": "<earlier@example.com>", "references": "<earlier@example.com>",
+    "mime-version": "1.0", "content-type": "text/plain; charset=us-ascii", "content-transfer-encoding": "7bit",
+  }
+  DRAFT_ORDER = ["from", "to", "cc", "subject", "date", "message-id", "sender", "reply-to", "in-reply-to",
+                 "references", "mime-version", "content-type", "content-transfer-encoding"]
+
+  @staticmethod
+  def nonce_from_the_draft_text(headers, body, iat):
+    canonical = "".join(f"{name}:{' '.join(headers[name].split())}\r\n" for name in
+                        TestMessageBindingNonceCoversTheThirteenFieldsEml11.DRAFT_ORDER if name in headers)
+    canonical += "hardware-trust-proof:"
+    simple_body = body.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    while simple_body.endswith(b"\r\n\r\n"):
+      simple_body = simple_body[:-2]
+    message_binding = (hashlib.sha256(canonical.encode()).digest() + hashlib.sha256(simple_body).digest()
+                       + iat.to_bytes(8, "big"))
+    return b64url(hashlib.sha256(message_binding).digest())
+
+  def test_library_nonce_equals_the_independent_computation(self):
+    assert _compute_message_binding_nonce(self.ALL_THIRTEEN_FIELDS, BODY, NOW) == \
+      self.nonce_from_the_draft_text(self.ALL_THIRTEEN_FIELDS, BODY, NOW)
+
+  @pytest.mark.parametrize("field_name", ["cc", "sender", "in-reply-to", "references", "reply-to"])
+  def test_each_of_the_fields_added_in_03_changes_the_nonce(self, field_name):
+    changed = dict(self.ALL_THIRTEEN_FIELDS, **{field_name: "changed@example.net"})
+    assert _compute_message_binding_nonce(changed, BODY, NOW) != \
+      _compute_message_binding_nonce(self.ALL_THIRTEEN_FIELDS, BODY, NOW)
+
+  def test_a_message_that_gains_a_cc_after_signing_fails_the_nonce(self):
+    signed_without_cc = presentation()
+    with_cc_added = dict(HEADERS, cc="added-later@example.net")
+    result = verify(signed_without_cc, headers=with_cc_added)
+    assert_result(result, "fail", "nonce mismatch")
+
+  def test_header_that_is_not_among_the_thirteen_is_not_covered(self):
+    with_received_added = dict(HEADERS, received="by mx1.example.net")
+    assert _compute_message_binding_nonce(with_received_added, BODY, NOW) == \
+      _compute_message_binding_nonce(HEADERS, BODY, NOW)
