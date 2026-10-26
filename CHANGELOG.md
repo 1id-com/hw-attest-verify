@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Tests and documentation only; the published 3.0.0 package is unchanged.
+
+- The five real appendix captures were regenerated through the live system under
+  revision -03 on 2026-10-27 (published `oneid` 4.0.0 and `oneid-enroll` 3.0.0,
+  verified by this package 3.0.0 in the MailPal milter) and are recorded under
+  `tests/fixtures/real_examples_2026_10_27` together with the live RFC 8414 and
+  JWK Set answers. All five pass offline in both modes (sovereign, portable,
+  enclave, virtual, declared); the strict expected failures are gone.
+- The revision -02 captures of 2026-09-24 moved to
+  `tests/fixtures/revision_02_captures_2026_09_24`, where they only prove that a
+  revision -03 verifier rejects them (`make pypi-check-published-verify` runs the
+  published verifier over `tests/fixtures/real_examples_*` only).
+- `test_real_example_is_expired_when_checked_as_current` sets the clock instead of
+  depending on the capture being more than one hour old (during that first hour the
+  proof is `policy` for a different reason: the local age policy).
+
 ## 3.0.0 (2026-10-26)
 
 Implements revision -03 of `draft-drake-email-hardware-attestation` (amendments

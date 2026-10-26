@@ -1,0 +1,110 @@
+Delivered-To: id-csnxq-phcmb-pvcmm-xcdmb@mailpal.com
+X-Spam-Status: No
+Received: from [169.254.206.65] (unknown [110.143.72.26] (AS1221 Telstra Limited, AU))
+	(using TLSv1.3 with cipher TLS13_AES_256_GCM_SHA384)
+	by mail.mailpal.com (Stalwart SMTP) with ESMTPSA id 4ADBF608253E125;
+	Mon, 26 Oct 2026 18:22:37 +0000
+Authentication-Results: mail.mailpal.com; none
+Return-Path: <id-csnxq-phcmb-pvcmm-xcdmb@mailpal.com>
+DKIM-Signature: v=1; a=rsa-sha256; s=rsa; d=mailpal.com; c=relaxed/relaxed; r=y;
+	h=MIME-Version:Content-Transfer-Encoding:Content-Type:Message-ID:Date
+	:Subject:To:From:Reply-To:Cc:In-Reply-To:References:List-Id
+	:List-Unsubscribe:Organization:User-Agent:Thread-Topic:Thread-Index;
+	t=1793038957; x=1793902957; bh=UpNv/u4NEGGV0VPACHjdNjyQfrzCqbgBATphJjFgGIs=
+	; b=I6himCc+0EMdz0C3bZ011q3uFhBfMccwWExmrvsAq4aSpAWupkxcgQm/HoDm2VPkmxEq0ei
+	mYTqjng3+Pabgzo12ySH0x/6RrNBMZEg7BinMREhBmcqhg95PH18AxX3Z19EmHAdntBNaxJC/eR
+	Ve5HP0PP3W7/o+bFnSK60QlEJy0Chsr8Upwl/vrqxEcsJdWemWZtDvbtYG5PuhrrfBJUmaTZy0U
+	q67+ansM3IcYHeoXM5pJMUDfoct6ytnWr1VQzKRDPkGQfyeyLt5D0OnffeZCVNIm2xzRfZQTcgY
+	Vu6hT14TdlwpDdbCLVLK/LImPTsxLzvbP4qQcyXBF+C9vQ==;
+Authentication-Results: mailpal.com; hw-attest=pass header.typ=PIV header.alg=ES256 header.path=registrar header.tier=portable header.aid="urn:aid:global:id-csnxq-phcmb-pvcmm-xcdmb"
+Authentication-Results: mailpal.com; hw-trust=pass header.mode=identified header.tier=portable header.issuer="https://1id.com/realms/agents" header.aid="urn:aid:global:id-csnxq-phcmb-pvcmm-xcdmb"
+From: AIRS-example-portable <id-csnxq-phcmb-pvcmm-xcdmb@mailpal.com>
+To: id-csnxq-phcmb-pvcmm-xcdmb@mailpal.com
+Subject: Example 2: portable-tier PIV/YubiKey (Combined Mode)
+Date: Tue, 27 Oct 2026 05:22:27 +1100
+Message-ID: <179303894757.9288.17119535157055262523@mailpal.com>
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+MIME-Version: 1.0
+Hardware-Trust-Proof: eyJhbGciOiJFUzI1NiIsImtpZCI6IjFpZC1od2F0dGVzdC1lczI1Ni0x
+ IiwidHlwIjoiYWlycy1lbWFpbCtzZC1qd3QifQ.eyJpc3MiOiJodHRwczovLzFpZC5jb20vcmVhbG
+ 1zL2FnZW50cyIsImlhdCI6MTc5MzAzODk1MiwiZXhwIjoxNzkzMDQyNTUyLCJub25jZSI6ImtjYzZ
+ yOGNRMGpOaFNBOGY1aW9CTG12VnF6Vl8zbkR0S2FJSF9RSUsteHciLCJfc2RfYWxnIjoic2hhLTI1
+ NiIsIl9zZCI6WyJBYVA2RGQ1Q0YyNmtzNXpGOVExeG9qeFVWYXFpX25MeFNvUVFoeVdXMFMwIiwiW
+ Ut1Wk56UUdBeDFLVG93NzJSNDF5aTJZdXdMUmZSZXk5ZzJlX08wZWhsWSJdLCJjbmYiOnsiandrIj
+ p7Imt0eSI6IkVDIiwiY3J2IjoiUC0yNTYiLCJ4IjoicEk4V2hxQ1lIdkFUdlJlOGFKRlh4Vm1fbjF
+ 5enF2MVJQTzJNZHpfZm1xNCIsInkiOiJBdy1xd2YxZ2dhNzZ5cTJPY1EtTDBLLS1BbE5MYnB1TVRZ
+ VEZMLVNvMVFRIn19fQ.hhY3QBXmIQhEjn8dFeWOdEKgfbsvkR4i2AIjNBUba3p8ftxmf9hhYJZXAl
+ _OJHNc15EFrn2e5uG-wNmzX5EHsQ~WyJ2LTBhU1ZPVDA3ZGp5UV9EQ3I3SF9nIiwiYWlkIix7InRy
+ dXN0X3RpZXIiOiJwb3J0YWJsZSJ9XQ~WyJvQ1RJRlc3OEVEemFtSzFDOHV6dGhRIiwic3ViIiwidX
+ JuOmFpZDpnbG9iYWw6aWQtY3NueHEtcGhjbWItcHZjbW0teGNkbWIiXQ~
+X-1ID-Contact-Token: ea8ed697
+Hardware-Attestation: v=1;
+ typ=PIV;
+ alg=ES256;
+ h=from:to:cc:subject:date:message-id:sender:reply-to:in-reply-to:references:
+ mime-version:content-type:content-transfer-encoding:hardware-trust-proof:from:
+ to:cc:subject:date:message-id:sender:reply-to:in-reply-to:references:
+ mime-version:content-type:content-transfer-encoding:hardware-trust-proof;
+ bh=UpNv_u4NEGGV0VPACHjdNjyQfrzCqbgBATphJjFgGIs;
+ ts=1793038953;
+ chain=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
+ NWOdykrUuBA4w==;
+ aid=urn:aid:global:id-csnxq-phcmb-pvcmm-xcdmb;
+ bind=eyJhbGciOiJFUzI1NiIsImtpZCI6IjFpZC1od2F0dGVzdC1lczI1Ni0xIiwidHlwIjoiYWly
+ cy1lbWFpbC1iaW5kaW5nK2p3dCJ9.eyJpc3MiOiJodHRwczovLzFpZC5jb20vcmVhbG1zL2FnZW50
+ cyIsInN1YiI6InVybjphaWQ6Z2xvYmFsOmlkLWNzbnhxLXBoY21iLXB2Y21tLXhjZG1iIiwiaWF0I
+ joxNzkzMDM4OTUyLCJleHAiOjE3OTMwNDI1NTIsImNuZiI6eyJqd2siOnsia3R5IjoiRUMiLCJjcn
+ YiOiJQLTI1NiIsIngiOiJwSThXaHFDWUh2QVR2UmU4YUpGWHhWbV9uMXl6cXYxUlBPMk1kel9mbXE
+ 0IiwieSI6IkF3LXF3ZjFnZ2E3NnlxMk9jUS1MMEstLUFsTkxicHVNVFlURkwtU28xUVEifX0sImFp
+ ZCI6eyJ0cnVzdF90aWVyIjoicG9ydGFibGUifX0.7beiQevBcufYiV9i64nPXSYlE84jdn8eOVQSa
+ SUL9e1AC12r8JGr2OYf9MG76gcqZl52aZzloURiGbRFDnlY4Q
+
+Hardware-attested email from the AIRS reference implementation.
+Identity tier: portable

@@ -12,8 +12,8 @@ What this proves that the unit tests cannot:
   - the Combined-mode relationship (cnf.jwk equals the CMS signer key, equal aid, equal tier) holds (EML-09);
   - an expired binding assertion and an expired SD-JWT are `policy` with the cause, not `fail` (EML-02).
 
-The real captures of the draft's appendix are -02 messages and cannot verify here; they are replaced by captures made
-through the live system (see test_combined_mode_and_real_example_emails.py).
+The real captures of the draft's appendix are revision -03 messages made through the live system on 2026-10-27; they
+are verified in test_combined_mode_and_real_example_emails.py, which also proves that the -02 captures are rejected.
 """
 
 import base64

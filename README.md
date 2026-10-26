@@ -215,9 +215,9 @@ package.
 Verified end-to-end by gates G4.2 (tamper suite), G4.3 (live 5-tier
 round trips), and G4.6 (the draft's own appendix examples re-verify
 through this CLI; `tests/test_combined_mode_and_real_example_emails.py`
-re-verifies the real appendix emails offline; the revision -02 captures there
-are recorded as expected failures until they are replaced by captures made
-through the live system under revision -03). The manufacturer-rooted path is
+re-verifies the five real appendix emails (revision -03 captures made through
+the live system on 2026-10-27) offline, and checks that the revision -02
+captures of 2026-09-24 are rejected). The manufacturer-rooted path is
 reserved by the draft (EML-07): no evidence profile ties a hardware key to its
 manufacturer, so none is invented here and none is ever reported (AUD-F21).
 `tests/test_revision_03_combined_mode_end_to_end.py` builds complete

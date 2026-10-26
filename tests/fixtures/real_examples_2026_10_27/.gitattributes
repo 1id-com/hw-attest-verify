@@ -1,0 +1,2 @@
+# Real emails: keep the exact CRLF bytes the signatures cover.
+*.eml -text
